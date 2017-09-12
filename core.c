@@ -190,6 +190,7 @@ u2f_chl_err(u2f_chl *chl, u2f_err err, const char *file, int line)
         }
     };
 
+    fprintf(stderr, "error@%s:%d\n", file, line);
     return write(sd_event_source_get_io_fd(chl->svc->hid), &ue, sizeof(ue));
 }
 
@@ -352,11 +353,15 @@ u2f_svc_mtu(u2f_svc *svc)
 {
     sd_bus_message_auto *msg = NULL;
     const uint8_t *bytes = NULL;
+    const char *obj = NULL;
     size_t size = 0;
     int r;
 
-    r = sd_bus_call_method(svc->bus, "org.bluez",
-                           svc->chr[CHR_CONTROL_POINT_LENGTH],
+    obj = svc->chr[CHR_CONTROL_POINT_LENGTH];
+    if (!obj)
+        return -ENOENT;
+
+    r = sd_bus_call_method(svc->bus, "org.bluez", obj,
                            "org.bluez.GattCharacteristic1", "ReadValue",
                            NULL, &msg, "a{sv}", 0);
     if (r < 0)

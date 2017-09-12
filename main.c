@@ -166,7 +166,7 @@ on_uhid_data(u2f_svc *svc, const uint8_t *buf, size_t len)
 
     /* Data layout: see U2F HID Section 2.4. Channel ID already removed. */
 
-    if (buf[5] & U2F_CMD_BIT) {
+    if (buf[4] & U2F_CMD_BIT) {
         if (chl) {
             (void) u2f_chl_err(chl, U2F_ERR_CHANNEL_BUSY);
             u2f_chl_free(chl);
@@ -179,18 +179,19 @@ on_uhid_data(u2f_svc *svc, const uint8_t *buf, size_t len)
         if (!chl)
             return u2f_chl_err(&tmp, U2F_ERR_OTHER);
 
+        chl->svc = svc;
         list_app(&svc->req, &chl->lst);
     } else if (chl) {
         uint16_t rem = chl->pkt->cnt - chl->len;
         uint16_t cnt = (len - 5) < rem ? len - 5 : rem;
 
-        if (buf[5] != chl->seq) {
+        if (buf[4] != chl->seq) {
             (void) u2f_chl_err(chl, U2F_ERR_INVALID_SEQ);
             u2f_chl_free(chl);
             return 0;
         }
 
-        memcpy(&chl->pkt->buf[chl->len], &buf[5], cnt);
+        memcpy(&chl->pkt->buf[chl->len], &buf[4], cnt);
         chl->len += cnt;
         chl->seq++;
     } else {
