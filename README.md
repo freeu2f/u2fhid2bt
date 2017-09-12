@@ -1,8 +1,4 @@
-This project runs tests against Bluetooth U2F devices.
-
-However, we do not currently run any tests. Currently, it monitors D-Bus for
-U2F devices and creates an internal object which represents the state of U2F
-services on a device. More or less, this code pretty must just prints which
-U2F devices it finds over Bluetooth.
-
-This code can also be extrapolated for use in a HID transport driver.
+This project emulates a U2F HID device and proxies the data to paired U2F
+Bluetooth devices. It doesn't fully work yet. But we can at least detect
+Bluetooth devices, make emulated U2F HID devices and handle some basic packets,
+including the U2FHID_INIT command.
