@@ -19,7 +19,7 @@ typedef enum {
 } u2f_ka;
 
 typedef enum {
-    U2F_ERR_SUCESS        = 0x00,
+    U2F_ERR_SUCCESS       = 0x00,
     U2F_ERR_INVALID_CMD   = 0x01,
     U2F_ERR_INVALID_PAR   = 0x02,
     U2F_ERR_INVALID_LEN   = 0x03,
