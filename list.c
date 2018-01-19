@@ -3,7 +3,7 @@
 #include "list.h"
 
 void
-list_app(list *lst, list *itm)
+u2f_list_app(u2f_list *lst, u2f_list *itm)
 {
     itm->nxt = lst;
     itm->prv = lst->prv;
@@ -12,7 +12,7 @@ list_app(list *lst, list *itm)
 }
 
 void
-list_pre(list *lst, list *itm)
+u2f_list_pre(u2f_list *lst, u2f_list *itm)
 {
     itm->prv = lst;
     itm->nxt = lst->nxt;
@@ -21,7 +21,7 @@ list_pre(list *lst, list *itm)
 }
 
 void
-list_rem(list *itm)
+u2f_list_rem(u2f_list *itm)
 {
     itm->nxt->prv = itm->prv;
     itm->prv->nxt = itm->nxt;

@@ -3,23 +3,23 @@
 #pragma once
 #include <stddef.h>
 
-#define list_itm(type, meth, item) \
-    ((type *) (((char *) item) - offsetof(type, meth)))
+#define u2f_list_itm(type, memb, item) \
+    ((type *) (((char *) item) - offsetof(type, memb)))
 
-#define list_new(lst) \
-    *(lst) = (list) { (lst), (lst) }
+#define u2f_list_new(lst) \
+    *(lst) = (u2f_list) { (lst), (lst) }
 
-typedef struct list list;
-struct list {
-    list *prv;
-    list *nxt;
+typedef struct u2f_list u2f_list;
+struct u2f_list {
+    u2f_list *prv;
+    u2f_list *nxt;
 };
 
 void
-list_app(list *lst, list *itm);
+u2f_list_app(u2f_list *lst, u2f_list *itm);
 
 void
-list_pre(list *lst, list *itm);
+u2f_list_pre(u2f_list *lst, u2f_list *itm);
 
 void
-list_rem(list *itm);
+u2f_list_rem(u2f_list *itm);

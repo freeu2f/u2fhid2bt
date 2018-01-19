@@ -1,6 +1,8 @@
 /* vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80: */
 
-#include "core.h"
+#include "uhid.h"
+#include "gatt.h"
+#include "list.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -10,11 +12,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
-
-#define DEV_HID_VER 2
-#define DEV_VER_MAJ 0
-#define DEV_VER_MIN 0
-#define DEV_VER_BLD 0
+#include <time.h>
 
 #define MAN_PATH "/"
 #define PRF_PATH "/prf"
@@ -28,182 +26,95 @@
     "type='signal',sender='org.bluez',path='/',member='InterfacesRemoved'," \
     "interface='org.freedesktop.DBus.ObjectManager'"
 
-#define VAL_MATCH \
-    "type='signal',sender='org.bluez',member='PropertiesChanged'," \
-    "interface='org.freedesktop.DBus.Properties'," \
-    "arg0='org.bluez.GattCharacteristic1'"
+#define sd_bus_auto \
+    sd_bus __attribute__((cleanup(sd_bus_unrefp)))
 
-static list svcs = { &svcs, &svcs };
+#define sd_bus_message_auto \
+    sd_bus_message __attribute__((cleanup(sd_bus_message_unrefp)))
 
-static const struct {
-    const char *name;
-    const char *uuid;
-} svc_props[] = { /* Index MUST match chr values! */
-    { "u2fControlPoint", "f1d0fff1-deaa-ecee-b42f-c9ba7ed623bb" },
-    { "u2fStatus", "f1d0fff2-deaa-ecee-b42f-c9ba7ed623bb" },
-    { "u2fControlPointLength", "f1d0fff3-deaa-ecee-b42f-c9ba7ed623bb" },
-    { "u2fServiceRevision", "00002a28-0000-1000-8000-00805f9b34fb" },
-    { "u2fServiceRevisionBitfield", "f1d0fff4-deaa-ecee-b42f-c9ba7ed623bb" },
-};
+#define sd_event_auto \
+    sd_event __attribute__((cleanup(sd_event_unrefp)))
 
-static u2f_chl *
-find_chl_by_cid(const list *chls, uint32_t cid)
+#define sd_event_source_auto \
+    sd_event_source __attribute__((cleanup(sd_event_source_unrefp)))
+
+static u2f_list vu2fs = { &vu2fs, &vu2fs };
+
+typedef struct {
+    u2f_list         list;
+    u2f_gatt        *gatt;
+    u2f_uhid        *uhid;
+} vu2f;
+
+static void
+vu2f_free(vu2f *v)
 {
-    for (list *l = chls->nxt; l != chls; l = l->nxt) {
-        u2f_chl *chl = list_itm(u2f_chl, lst, l);
-        if (chl->cid == cid)
-            return chl;
-    }
+    if (!v)
+        return;
 
-    return NULL;
+    u2f_list_rem(&v->list);
+    u2f_uhid_free(v->uhid);
+    u2f_gatt_free(v->gatt);
+    free(v);
 }
 
-static u2f_svc *
-find_svc_by_obj(const char *obj)
+static void
+uhid_cb(const u2f_frm *frm, void *misc)
 {
-    if (!obj)
+    vu2f *v = misc;
+
+    u2f_uhid_enable(v->uhid, false);
+    u2f_gatt_send(v->gatt, frm);
+}
+
+static void
+gatt_cb(const u2f_frm *frm, void *misc)
+{
+    vu2f *v = misc;
+
+    u2f_uhid_enable(v->uhid, true);
+    u2f_uhid_send(v->uhid, frm);
+}
+
+static vu2f *
+vu2f_new(sd_bus *bus, const char *obj)
+{
+    vu2f *v = NULL;
+
+    v = calloc(1, sizeof(*v));
+    if (!v)
         return NULL;
 
-    for (list *l = svcs.nxt; l != &svcs; l = l->nxt) {
-        u2f_svc *svc = list_itm(u2f_svc, lst, l);
-        if (strcmp(svc->obj, obj) == 0)
-            return svc;
-    }
+    u2f_list_new(&v->list);
 
+    v->uhid = u2f_uhid_new("name", "phys", "uniq", uhid_cb, v);
+    if (!v->uhid)
+        goto error;
+
+    v->gatt = u2f_gatt_new(bus, obj, gatt_cb, v);
+    if (!v->gatt)
+        goto error;
+
+    return v;
+
+error:
+    vu2f_free(v);
     return NULL;
 }
 
-static u2f_svc *
-find_svc_by_chr(const char *obj, u2f_chr chr)
+static vu2f *
+find_vu2f_by_svc(const char *svc)
 {
-    if (!obj)
+    if (!svc)
         return NULL;
 
-    for (list *l = svcs.nxt; l != &svcs; l = l->nxt) {
-        u2f_svc *svc = list_itm(u2f_svc, lst, l);
-        if (svc->chr[chr] && strcmp(svc->chr[chr], obj) == 0)
-            return svc;
+    for (u2f_list *l = vu2fs.nxt; l != &vu2fs; l = l->nxt) {
+        vu2f *v = u2f_list_itm(vu2f, list, l);
+        if (v->gatt && strcmp(u2f_gatt_svc(v->gatt), svc) == 0)
+            return v;
     }
 
     return NULL;
-}
-
-static int
-on_cmd_init(u2f_chl *chl)
-{
-    if (chl->cid != U2F_CID_BROADCAST)
-        return u2f_chl_err(chl, U2F_ERR_INVALID_CID);
-
-    if (chl->pkt->cnt != 8)
-        return u2f_chl_err(chl, U2F_ERR_INVALID_LEN);
-
-    if (u2f_svc_mtu(chl->svc) < 0) {
-        fprintf(stderr, "Device is unreachable! %s\n", chl->svc->obj);
-        return u2f_chl_err(chl, U2F_ERR_OTHER);
-    }
-
-    while (chl->svc->cid == U2F_CID_RESERVED ||
-           chl->svc->cid == U2F_CID_BROADCAST)
-        chl->svc->cid++;
-
-    uint64_t nonce = load64(chl->pkt->buf);
-    uint8_t msg[] = {
-        save32(chl->cid),
-        U2F_CMD_INIT,
-        save16(17), /* Length */
-        save64(nonce),
-        save32(chl->svc->cid),
-        DEV_HID_VER,
-        DEV_VER_MAJ,
-        DEV_VER_MIN,
-        DEV_VER_BLD,
-        0x00 /* Capabilities flags */
-    };
-
-    return u2f_chl_rep_buf(chl, msg, sizeof(msg));
-}
-
-static int
-on_cmd(u2f_chl *chl)
-{
-    u2f_chl *tmp = NULL;
-    int r;
-
-    if (chl->pkt->cmd == U2F_CMD_INIT)
-        return on_cmd_init(chl);
-
-    if (chl->cid == U2F_CID_RESERVED || chl->cid == U2F_CID_BROADCAST)
-        return u2f_chl_err(chl, U2F_ERR_INVALID_CID);
-
-    tmp = u2f_chl_new(chl->cid, NULL, 0);
-    if (!tmp)
-        return u2f_chl_err(chl, U2F_ERR_OTHER);
-
-    list_app(&chl->svc->rep, &tmp->lst);
-    tmp->svc = chl->svc;
-
-    r = u2f_chl_req(chl);
-    if (r < 0) {
-        u2f_chl_free(tmp);
-        return u2f_chl_err(chl, U2F_ERR_OTHER);
-    }
-
-    return r;
-}
-
-static int
-on_uhid_data(u2f_svc *svc, const uint8_t *buf, size_t len)
-{
-    if (len < 4)
-        return 0; /* Input data is too malformed to make an error. */
-
-    uint32_t cid = load32(buf);
-    u2f_chl *chl = find_chl_by_cid(&svc->req, cid);
-    u2f_chl tmp = { .cid = cid, .svc = svc };
-
-    if (len < 5)
-        return u2f_chl_err(&tmp, U2F_ERR_INVALID_LEN);
-
-    /* Data layout: see U2F HID Section 2.4. Channel ID already removed. */
-
-    if (buf[4] & U2F_CMD_BIT) {
-        if (chl) {
-            (void) u2f_chl_err(chl, U2F_ERR_CHANNEL_BUSY);
-            u2f_chl_free(chl);
-        }
-
-        if (len < 3)
-            return u2f_chl_err(&tmp, U2F_ERR_INVALID_LEN);
-
-        chl = u2f_chl_new(cid, &buf[4], len - 4);
-        if (!chl)
-            return u2f_chl_err(&tmp, U2F_ERR_OTHER);
-
-        chl->svc = svc;
-        list_app(&svc->req, &chl->lst);
-    } else if (chl) {
-        uint16_t rem = chl->pkt->cnt - chl->len;
-        uint16_t cnt = (len - 5) < rem ? len - 5 : rem;
-
-        if (buf[4] != chl->seq) {
-            (void) u2f_chl_err(chl, U2F_ERR_INVALID_SEQ);
-            u2f_chl_free(chl);
-            return 0;
-        }
-
-        memcpy(&chl->pkt->buf[chl->len], &buf[4], cnt);
-        chl->len += cnt;
-        chl->seq++;
-    } else {
-        return u2f_chl_err(&tmp, U2F_ERR_INVALID_CID);
-    }
-
-    if (chl->len == chl->pkt->cnt) {
-        (void) on_cmd(chl);
-        u2f_chl_free(chl);
-    }
-
-    return 0;
 }
 
 static int
@@ -289,30 +200,23 @@ on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
                                          NULL, "oa{sv}", MAN_PATH, 0);
             if (r < 0)
                 return r;
+            fprintf(stderr, "+%s\n", obj);
         } else if (strcmp(iface, "org.bluez.GattService1") == 0 &&
                    uuid && strcasecmp(uuid, SVC_UUID) == 0) {
-            u2f_svc *svc = find_svc_by_obj(obj);
-            if (!svc) {
-                svc = u2f_svc_new(bus, on_uhid_data, parent, obj);
-                if (!svc)
+            vu2f *v = find_vu2f_by_svc(obj);
+            if (!v) {
+                v = vu2f_new(bus, obj);
+                if (!v)
                     return -ENOMEM;
 
-                list_app(&svcs, &svc->lst);
-                fprintf(stderr, "+%s\n", svc->obj);
+                u2f_list_app(&vu2fs, &v->list);
+                fprintf(stderr, "+%s\n", obj);
             }
         } else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0) {
-            u2f_svc *svc = find_svc_by_obj(parent);
-
-            for (size_t i = 0; svc && i < _CHR_TOTAL; i++) {
-                if (strcasecmp(svc_props[i].uuid, uuid) != 0)
-                    continue;
-
-                free(svc->chr[i]);
-                svc->chr[i] = strdup(obj);
-                if (!svc->chr[i])
-                    return -ENOMEM;
-
-                break;
+            vu2f *v = find_vu2f_by_svc(parent);
+            if (v) {
+                u2f_gatt_set(v->gatt, uuid, obj);
+                fprintf(stderr, "+%s\n", obj);
             }
         }
     }
@@ -356,123 +260,23 @@ on_svc_iface_rem(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
             return r;
 
         if (strcmp(iface, "org.bluez.GattService1") == 0) {
-            u2f_svc *svc = find_svc_by_obj(obj);
-            if (svc) {
-                fprintf(stderr, "-%s\n", svc->obj);
-                u2f_svc_free(svc);
+            fprintf(stderr, "-%s\n", obj);
+            vu2f_free(find_vu2f_by_svc(obj));
+        } else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0) {
+            fprintf(stderr, "-%s\n", obj);
+
+            for (u2f_list *l = vu2fs.nxt; l != &vu2fs; l = l->nxt) {
+                vu2f *v = u2f_list_itm(vu2f, list, l);
+                const char *id = NULL;
+
+                if (!v->gatt)
+                    continue;
+
+                id = u2f_gatt_has(v->gatt, obj);
+                if (id)
+                    u2f_gatt_set(v->gatt, id, NULL);
             }
         }
-    }
-
-    r = sd_bus_message_exit_container(m);
-    if (r < 0)
-        return r;
-
-    return 0;
-}
-
-static int
-on_svc_reply(const char *obj, const uint8_t *buf, size_t len)
-{
-    u2f_svc *svc = NULL;
-    u2f_chl *chl = NULL;
-
-    svc = find_svc_by_chr(obj, CHR_STATUS);
-    if (!svc || len < 1 || svc->rep.nxt == &svc->rep)
-        return 0;
-
-    chl = list_itm(u2f_chl, lst, svc->rep.nxt);
-    if (buf[0] & U2F_CMD_BIT) {
-        if (len < 3)
-            return 0;
-
-        if (chl->pkt) {
-            u2f_chl_err(chl, U2F_ERR_OTHER);
-            u2f_chl_free(chl);
-            return on_svc_reply(obj, buf, len);
-        }
-
-        chl->len = len;
-        chl->pkt = u2f_pkt_new(buf, &chl->len);
-        if (!chl->pkt)
-            goto error;
-    } else if (chl->pkt) {
-        uint16_t rem = chl->pkt->cnt - chl->len;
-        uint16_t cnt = (len - 1) < rem ? len - 1 : rem;
-
-        if (buf[0] != chl->seq)
-            goto error;
-
-        memcpy(&chl->pkt->buf[chl->len], &buf[1], cnt);
-        chl->len += cnt;
-        chl->seq++;
-    } else {
-        goto error;
-    }
-
-    if (chl->len == chl->pkt->cnt) {
-        if (u2f_chl_rep(chl) < 0)
-            goto error;
-    }
-
-    u2f_chl_free(chl);
-    return 0;
-
-error:
-    (void) u2f_chl_err(chl, U2F_ERR_OTHER);
-    u2f_chl_free(chl);
-    return 0;
-}
-
-static int
-on_svc_gatt_chr_notify(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
-{
-    int r;
-
-    r = sd_bus_message_skip(m, "s");
-    if (r < 0)
-        return r;
-
-    r = sd_bus_message_enter_container(m, 'a', "{sv}");
-    if (r < 0)
-        return r;
-
-    while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
-        const char *name = NULL;
-
-        r = sd_bus_message_read(m, "s", &name);
-        if (r < 0)
-            return r;
-
-        if (strcmp(name, "Value") == 0) {
-            union {
-                const void *buf;
-                const uint8_t *arr;
-            } out = {};
-            size_t len = 0;
-
-            r = sd_bus_message_enter_container(m, 'v', "ay");
-            if (r < 0)
-                return r;
-
-            r = sd_bus_message_read_array(m, 'y', &out.buf, &len);
-            if (r < 0)
-                return r;
-
-            r = sd_bus_message_exit_container(m);
-            if (r < 0)
-                return r;
-
-            (void) on_svc_reply(sd_bus_message_get_path(m), out.arr, len);
-        } else {
-            r = sd_bus_message_skip(m, "v");
-            if (r < 0)
-                return r;
-        }
-
-        r = sd_bus_message_exit_container(m);
-        if (r < 0)
-            return r;
     }
 
     r = sd_bus_message_exit_container(m);
@@ -493,10 +297,6 @@ setup_registration(sd_bus *bus)
         error(EXIT_FAILURE, -r, "Error registering for bluetooth interfaces");
 
     r = sd_bus_add_match(bus, NULL, REM_MATCH, on_svc_iface_rem, NULL);
-    if (r < 0)
-        error(EXIT_FAILURE, -r, "Error registering for bluetooth interfaces");
-
-    r = sd_bus_add_match(bus, NULL, VAL_MATCH, on_svc_gatt_chr_notify, NULL);
     if (r < 0)
         error(EXIT_FAILURE, -r, "Error registering for bluetooth interfaces");
 
@@ -544,20 +344,10 @@ prf_props(sd_bus *bus, const char *path, const char *interface,
           const char *property, sd_bus_message *reply, void *userdata,
           sd_bus_error *ret_error)
 {
-    int r;
-
     if (strcmp(property, "UUIDs") != 0)
         return -ENOENT;
 
-    r = sd_bus_message_open_container(reply, 'a', "s");
-    if (r < 0)
-        return r;
-
-    r = sd_bus_message_append(reply, "s", SVC_UUID);
-    if (r < 0)
-        return r;
-
-    return sd_bus_message_close_container(reply);
+    return sd_bus_message_append(reply, "as", 1, SVC_UUID);
 }
 
 static const sd_bus_vtable prf_vtable[] = {
@@ -587,11 +377,11 @@ main(int argc, char *argv[])
 
     r = sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
     if (r < 0)
-        error(EXIT_FAILURE, -r, "Error creating signal event source");
+        error(EXIT_FAILURE, -r, "Error creating SIGINT event source");
 
     r = sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
     if (r < 0)
-        error(EXIT_FAILURE, -r, "Error creating signal event source");
+        error(EXIT_FAILURE, -r, "Error creating SIGTERM event source");
 
     r = sd_bus_open_system(&bus);
     if (r < 0)
@@ -616,8 +406,13 @@ main(int argc, char *argv[])
 
     r = sd_event_loop(event);
 
-    while (svcs.nxt != &svcs)
-        u2f_svc_free(list_itm(u2f_svc, lst, svcs.nxt));
+    while (vu2fs.nxt != &vu2fs) {
+        vu2f *v = u2f_list_itm(vu2f, list, vu2fs.nxt);
+        u2f_list_rem(&v->list);
+        u2f_uhid_free(v->uhid);
+        u2f_gatt_free(v->gatt);
+        free(v);
+    }
 
     return r;
 }
