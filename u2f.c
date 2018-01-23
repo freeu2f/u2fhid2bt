@@ -16,7 +16,11 @@
  */
 
 #include "u2f.h"
+
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
 #include <endian.h>
 
 static void
@@ -28,9 +32,14 @@ dump(const uint8_t *buf, size_t len)
 }
 
 void
-u2f_cmd_dump(const char *prfx, const u2f_cmd *cmd, size_t len)
+u2f_cmd_dump(const u2f_cmd *cmd, size_t len, const char *prfx, ...)
 {
+    va_list ap;
     char c;
+
+    va_start(ap, prfx);
+    vfprintf(stderr, prfx, ap);
+    va_end(ap);
 
     switch (cmd->cmd) {
     case U2F_CMD_PING:      c = 'P'; break;
@@ -44,30 +53,56 @@ u2f_cmd_dump(const char *prfx, const u2f_cmd *cmd, size_t len)
     default:                c = 'U'; break;
     }
 
-    fprintf(stderr, "%s%c(%04hu): ", prfx, c, be16toh(cmd->len));
-    dump(cmd->buf, len - sizeof(*cmd));
+    fprintf(stderr, "%c(%04hu): ", c, be16toh(cmd->len));
+    dump(cmd->buf, len - offsetof(u2f_cmd, buf));
 }
 
 void
-u2f_seq_dump(const char *prfx, const u2f_seq *seq, size_t len)
+u2f_seq_dump(const u2f_seq *seq, size_t len, const char *prfx, ...)
 {
-    fprintf(stderr, "%sQ(%04hhu): ", prfx, seq->seq);
-    dump(seq->buf, len - sizeof(*seq));
+    va_list ap;
+
+    va_start(ap, prfx);
+    vfprintf(stderr, prfx, ap);
+    va_end(ap);
+
+    fprintf(stderr, "Q(%04hhu): ", seq->seq);
+    dump(seq->buf, len - offsetof(u2f_seq, buf));
 }
 
 void
-u2f_pkt_dump(const char *prfx, const u2f_pkt *pkt, size_t len)
+u2f_pkt_dump(const u2f_pkt *pkt, size_t len, const char *prfx, ...)
 {
-    fprintf(stderr, "%s", prfx);
+    va_list ap;
+
+    va_start(ap, prfx);
+    vfprintf(stderr, prfx, ap);
+    va_end(ap);
+
     if (pkt->cmd.cmd & U2F_CMD)
-        u2f_cmd_dump("", &pkt->cmd, len);
+        u2f_cmd_dump(&pkt->cmd, len - offsetof(u2f_pkt, cmd), "");
     else
-        u2f_seq_dump("", &pkt->seq, len);
+        u2f_seq_dump(&pkt->seq, len - offsetof(u2f_pkt, seq), "");
 }
 
 void
-u2f_frm_dump(const char *prfx, const u2f_frm *frm, size_t len)
+u2f_frm_dump(const u2f_frm *frm, size_t len, const char *prfx, ...)
 {
-    fprintf(stderr, "%s%08X ", prfx, frm->cid);
-    u2f_pkt_dump("", &frm->pkt, len - offsetof(u2f_frm, pkt));
+    va_list ap;
+
+    va_start(ap, prfx);
+    vfprintf(stderr, prfx, ap);
+    va_end(ap);
+
+    u2f_pkt_dump(&frm->pkt, len - offsetof(u2f_frm, pkt), "%08X ", frm->cid);
+}
+
+u2f_cmd *
+#undef u2f_cmd_mkerr
+u2f_cmd_mkerr(u2f_cmd *cmd, uint8_t err)
+{
+    cmd->cmd = U2F_CMD_ERROR;
+    cmd->len = htobe16(1);
+    cmd->buf[0] = err;
+    return cmd;
 }

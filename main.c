@@ -17,7 +17,6 @@
 
 #include "uhid.h"
 #include "gatt.h"
-#include "list.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -28,6 +27,8 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <time.h>
+
+#include <systemd/sd-bus.h>
 
 #define MAN_PATH "/"
 #define PRF_PATH "/prf"
@@ -41,25 +42,16 @@
     "type='signal',sender='org.bluez',path='/',member='InterfacesRemoved'," \
     "interface='org.freedesktop.DBus.ObjectManager'"
 
-#define sd_bus_auto \
-    sd_bus __attribute__((cleanup(sd_bus_unrefp)))
+typedef struct vu2f vu2f;
 
-#define sd_bus_message_auto \
-    sd_bus_message __attribute__((cleanup(sd_bus_message_unrefp)))
+struct vu2f {
+    vu2f     *prev;
+    vu2f     *next;
+    u2f_gatt *gatt;
+    u2f_uhid *uhid;
+};
 
-#define sd_event_auto \
-    sd_event __attribute__((cleanup(sd_event_unrefp)))
-
-#define sd_event_source_auto \
-    sd_event_source __attribute__((cleanup(sd_event_source_unrefp)))
-
-static u2f_list vu2fs = { &vu2fs, &vu2fs };
-
-typedef struct {
-    u2f_list         list;
-    u2f_gatt        *gatt;
-    u2f_uhid        *uhid;
-} vu2f;
+static vu2f vu2fs = { .prev = &vu2fs, .next = &vu2fs };
 
 static void
 vu2f_free(vu2f *v)
@@ -67,32 +59,29 @@ vu2f_free(vu2f *v)
     if (!v)
         return;
 
-    u2f_list_rem(&v->list);
+    v->prev->next = v->next;
+    v->next->prev = v->prev;
     u2f_uhid_free(v->uhid);
     u2f_gatt_free(v->gatt);
     free(v);
 }
 
 static void
-uhid_cb(const u2f_frm *frm, void *misc)
+uhid_cb(const u2f_cmd *cmd, void *misc)
 {
     vu2f *v = misc;
-
-    u2f_uhid_enable(v->uhid, false);
-    u2f_gatt_send(v->gatt, frm);
+    u2f_gatt_send(v->gatt, cmd);
 }
 
 static void
-gatt_cb(const u2f_frm *frm, void *misc)
+gatt_cb(const u2f_cmd *cmd, void *misc)
 {
     vu2f *v = misc;
-
-    u2f_uhid_enable(v->uhid, true);
-    u2f_uhid_send(v->uhid, frm);
+    u2f_uhid_send(v->uhid, cmd);
 }
 
 static vu2f *
-vu2f_new(sd_bus *bus, const char *obj)
+vu2f_new(const char *obj)
 {
     vu2f *v = NULL;
 
@@ -100,13 +89,14 @@ vu2f_new(sd_bus *bus, const char *obj)
     if (!v)
         return NULL;
 
-    u2f_list_new(&v->list);
+    v->next = v;
+    v->prev = v;
 
     v->uhid = u2f_uhid_new("name", "phys", "uniq", uhid_cb, v);
     if (!v->uhid)
         goto error;
 
-    v->gatt = u2f_gatt_new(bus, obj, gatt_cb, v);
+    v->gatt = u2f_gatt_new(obj, gatt_cb, v);
     if (!v->gatt)
         goto error;
 
@@ -123,8 +113,7 @@ find_vu2f_by_svc(const char *svc)
     if (!svc)
         return NULL;
 
-    for (u2f_list *l = vu2fs.nxt; l != &vu2fs; l = l->nxt) {
-        vu2f *v = u2f_list_itm(vu2f, list, l);
+    for (vu2f *v = vu2fs.next; v != &vu2fs; v = v->next) {
         if (v->gatt && strcmp(u2f_gatt_svc(v->gatt), svc) == 0)
             return v;
     }
@@ -220,11 +209,14 @@ on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
                    uuid && strcasecmp(uuid, SVC_UUID) == 0) {
             vu2f *v = find_vu2f_by_svc(obj);
             if (!v) {
-                v = vu2f_new(bus, obj);
+                v = vu2f_new(obj);
                 if (!v)
                     return -ENOMEM;
 
-                u2f_list_app(&vu2fs, &v->list);
+                v->next = &vu2fs;
+                v->prev = vu2fs.prev;
+                vu2fs.prev->next = v;
+                vu2fs.prev = v;
                 fprintf(stderr, "+%s\n", obj);
             }
         } else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0) {
@@ -280,8 +272,7 @@ on_svc_iface_rem(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
         } else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0) {
             fprintf(stderr, "-%s\n", obj);
 
-            for (u2f_list *l = vu2fs.nxt; l != &vu2fs; l = l->nxt) {
-                vu2f *v = u2f_list_itm(vu2f, list, l);
+            for (vu2f *v = vu2fs.next; v != &vu2fs; v = v->next) {
                 const char *id = NULL;
 
                 if (!v->gatt)
@@ -304,7 +295,7 @@ on_svc_iface_rem(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
 static void
 setup_registration(sd_bus *bus)
 {
-    sd_bus_message_auto *msg = NULL;
+    __attribute__((cleanup(sd_bus_message_unrefp))) sd_bus_message *msg = NULL;
     int r;
 
     r = sd_bus_add_match(bus, NULL, ADD_MATCH, on_svc_iface_add, NULL);
@@ -345,7 +336,10 @@ setup_registration(sd_bus *bus)
 static int
 on_dbus_io(sd_event_source *es, int fd, uint32_t revents, void *userdata)
 {
-    return sd_bus_process(userdata, NULL);
+    while (sd_bus_process(userdata, NULL) > 0)
+        continue;
+
+    return 0;
 }
 
 static int
@@ -375,8 +369,8 @@ static const sd_bus_vtable prf_vtable[] = {
 int
 main(int argc, char *argv[])
 {
-    sd_event_auto *event = NULL;
-    sd_bus_auto *bus = NULL;
+    __attribute__((cleanup(sd_event_unrefp))) sd_event *event = NULL;
+    __attribute__((cleanup(sd_bus_unrefp))) sd_bus *bus = NULL;
     sigset_t ss;
     int r;
 
@@ -398,12 +392,13 @@ main(int argc, char *argv[])
     if (r < 0)
         error(EXIT_FAILURE, -r, "Error creating SIGTERM event source");
 
-    r = sd_bus_open_system(&bus);
+    r = sd_bus_default_system(&bus);
     if (r < 0)
         error(EXIT_FAILURE, -r, "Error connecting to system bus");
 
     r = sd_event_add_io(event, NULL, sd_bus_get_fd(bus),
-                        EPOLLIN, on_dbus_io, bus);
+                        EPOLLIN | EPOLLPRI | EPOLLET | EPOLLRDHUP,
+                        on_dbus_io, bus);
     if (r < 0)
         error(EXIT_FAILURE, -r, "Error creating dbus event source");
 
@@ -421,9 +416,10 @@ main(int argc, char *argv[])
 
     r = sd_event_loop(event);
 
-    while (vu2fs.nxt != &vu2fs) {
-        vu2f *v = u2f_list_itm(vu2f, list, vu2fs.nxt);
-        u2f_list_rem(&v->list);
+    while (vu2fs.next != &vu2fs) {
+        vu2f *v = vu2fs.next;
+        v->next->prev = v->prev;
+        v->prev->next = v->next;
         u2f_uhid_free(v->uhid);
         u2f_gatt_free(v->gatt);
         free(v);

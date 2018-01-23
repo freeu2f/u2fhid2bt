@@ -25,8 +25,6 @@ add_project_arguments([
 libsystemd = dependency('libsystemd', version: '>=221')
 
 executable('u2fhid2bt',
-    'list.c',
-    'list.h',
     'uhid.c',
     'uhid.h',
     'gatt.c',

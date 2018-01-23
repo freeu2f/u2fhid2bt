@@ -16,7 +16,6 @@
  */
 
 #include "uhid.h"
-#include "list.h"
 
 #include <linux/uhid.h>
 #include <sys/types.h>
@@ -27,6 +26,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+
+#include <systemd/sd-bus.h>
+
+#define TIMEOUT 500000
 
 #define HID_VEND 0
 #define HID_PROD 0
@@ -39,44 +43,216 @@
 #define DEV_VER_MIN 0
 #define DEV_VER_BLD 0
 
+#define MAX_LEN \
+    (HID_FRME - offsetof(u2f_frm, pkt.cmd.buf) + (INT8_MAX + 1) * \
+     (HID_FRME - offsetof(u2f_frm, pkt.seq.buf)))
+
 typedef struct __attribute__((packed)) {
     uint8_t rid; // Report ID (1 byte); See (I think): USB HID 1.11 Section 5.6
     u2f_frm frm;
 } hid_frm;
 
-typedef struct {
-    u2f_list lst;
-    uint8_t  seq;
-    size_t   len;
-    u2f_frm *frm;
-} channel;
-
 struct u2f_uhid {
-    sd_event_source *src;
-    u2f_uhid_cb *cb;
-    u2f_list chls;
-    uint32_t cid;
-    void *misc;
+    sd_event_source *src; /* File data event source */
+    sd_event_source *out; /* Timeout event source */
+
+    uint32_t         cid; /* Channel ID iterator (for INIT command) */
+
+    u2f_uhid_cbk    *cbk; /* Callback for incoming request */
+    void            *msc; /* Misc. data for callback */
+
+    u2f_frm         *frm; /* Incoming request (in progress) */
+    uint8_t          seq; /* Sequence counter */
+    size_t           len; /* # bytes written in frm->pkt.cmd.buf */
 };
 
-static void
-channel_free(channel *chl)
+static int
+send_frm(int fd, uint32_t cid, u2f_pkt *pkt, size_t hdr,
+         const uint8_t *buf, size_t len)
 {
-    if (!chl)
-        return;
+    struct uhid_event ue = { .type = UHID_INPUT2 };
+    u2f_frm *frm = (u2f_frm *) ue.u.input2.data;
 
-    u2f_list_rem(&chl->lst);
-    free(chl->frm);
-    free(chl);
+    if (len > HID_FRME - offsetof(u2f_frm, pkt) - hdr)
+        len = HID_FRME - offsetof(u2f_frm, pkt) - hdr;
+
+    frm->cid = cid;
+    frm->pkt = *pkt;
+    memcpy(&ue.u.input2.data[offsetof(u2f_frm, pkt) + hdr], buf, len);
+    ue.u.input2.size = HID_FRME;
+
+    u2f_frm_dump(frm, offsetof(u2f_frm, pkt) + hdr + len, "<U ");
+    return write(fd, &ue, sizeof(ue)) == sizeof(ue) ? len : -errno;
+}
+
+static int
+send_reply(int fd, uint32_t cid, const u2f_cmd *cmd)
+{
+    size_t len = be16toh(cmd->len);
+    u2f_pkt pkt = {};
+    int r;
+
+    if (len > MAX_LEN)
+        return send_reply(fd, cid, u2f_cmd_mkerr(U2F_ERR_OTHER));
+
+    pkt.cmd = *cmd;
+    r = send_frm(fd, cid, &pkt, offsetof(u2f_pkt, cmd.buf), cmd->buf, len);
+    if (r < 0)
+        return r;
+
+    for (size_t off = r, seq = 0; off < len; off += r, seq++) {
+        pkt.seq.seq = seq;
+        r = send_frm(fd, cid, &pkt, offsetof(u2f_pkt, seq.buf),
+                     &cmd->buf[off], len - off);
+        if (r < 0)
+            return r;
+    }
+
+    return 0;
+}
+
+static int
+on_timeout(sd_event_source *s, uint64_t usec, void *userdata)
+{
+    u2f_uhid *uhid = userdata;
+
+    sd_event_source_unref(uhid->out);
+    uhid->out = NULL;
+
+    (void) u2f_uhid_send(uhid, u2f_cmd_mkerr(U2F_ERR_MSG_TIMEOUT));
+    return 0;
+}
+
+static void
+on_init(u2f_uhid *uhid, uint32_t cid, const u2f_cmd *creq)
+{
+    u2f_cmd *crep = alloca(sizeof(u2f_cmd) + sizeof(u2f_cmd_rep_init));
+    u2f_cmd_req_init *ireq = (u2f_cmd_req_init *) creq->buf;
+    u2f_cmd_rep_init *irep = (u2f_cmd_rep_init *) crep->buf;
+
+    if (be16toh(creq->len) != sizeof(u2f_cmd_req_init)) {
+        (void) send_reply(sd_event_source_get_io_fd(uhid->src), cid,
+                          u2f_cmd_mkerr(U2F_ERR_INVALID_LEN));
+        return;
+    }
+
+    crep->cmd = U2F_CMD_INIT;
+    crep->len = htobe16(sizeof(u2f_cmd_rep_init));
+    irep->non = ireq->non;
+    irep->cid = cid;
+    irep->ver = DEV_HID_VER;
+    irep->maj = DEV_VER_MAJ;
+    irep->min = DEV_VER_MIN;
+    irep->bld = DEV_VER_BLD;
+    irep->cap = 0x00;
+
+    while (irep->cid == U2F_CID_BROADCAST || irep->cid == U2F_CID_RESERVED)
+        irep->cid = ++(uhid->cid);
+
+    (void) send_reply(sd_event_source_get_io_fd(uhid->src), cid, crep);
+
+    if (uhid->frm && uhid->frm->cid == cid) {
+        free(uhid->frm);
+        uhid->frm = NULL;
+    }
+}
+
+static uint8_t
+on_cmd(u2f_uhid *uhid, uint32_t cid, const u2f_cmd *cmd, size_t len)
+{
+    uint64_t now = 0;
+
+    if (len < offsetof(hid_frm, frm.pkt.cmd.buf))
+        return U2F_ERR_INVALID_LEN;
+
+    if (be16toh(cmd->len) > MAX_LEN)
+        return U2F_ERR_INVALID_LEN;
+
+    if (len > be16toh(cmd->len))
+        len = be16toh(cmd->len);
+
+    switch (cid) {
+    case U2F_CID_RESERVED:
+        return U2F_ERR_INVALID_CID;
+
+    case U2F_CID_BROADCAST:
+        if (cmd->cmd == U2F_CMD_INIT)
+            break;
+        return U2F_ERR_INVALID_CID;
+    }
+
+    if (cmd->cmd == U2F_CMD_INIT) {
+        on_init(uhid, cid, cmd);
+        return U2F_ERR_SUCCESS;
+    }
+
+    if (uhid->frm) {
+        if (cid != uhid->frm->cid)
+            return U2F_ERR_CHANNEL_BUSY;
+
+        free(uhid->frm);
+        uhid->frm = NULL;
+        return U2F_ERR_INVALID_SEQ;
+    }
+
+    if (sd_event_now(sd_event_source_get_event(uhid->src),
+                     CLOCK_MONOTONIC, &now) < 0)
+        return U2F_ERR_OTHER;
+
+    uhid->seq = 0;
+    uhid->len = len;
+    uhid->frm = calloc(1, sizeof(u2f_frm) + be16toh(cmd->len));
+    if (!uhid->frm)
+        goto error;
+
+    uhid->frm->cid = cid;
+    uhid->frm->pkt.cmd = *cmd;
+    memcpy(uhid->frm->pkt.cmd.buf, cmd->buf, len);
+
+    if (sd_event_add_time(sd_event_source_get_event(uhid->src),
+                          &uhid->out, CLOCK_MONOTONIC, now + TIMEOUT, 1,
+                          on_timeout, uhid) < 0)
+        goto error;
+
+    return U2F_ERR_SUCCESS;
+
+error:
+    free(uhid->frm);
+    uhid->frm = NULL;
+    return U2F_ERR_OTHER;
+}
+
+static uint8_t
+on_seq(u2f_uhid *uhid, uint32_t cid, const u2f_seq *seq, size_t len)
+{
+    if (!uhid->frm)
+        return U2F_ERR_SUCCESS;
+
+    if (len > be16toh(uhid->frm->pkt.cmd.len) - uhid->len)
+        len = be16toh(uhid->frm->pkt.cmd.len) - uhid->len;
+
+    if (cid != uhid->frm->cid)
+        return U2F_ERR_SUCCESS;
+
+    if (seq->seq != uhid->seq++) {
+        free(uhid->frm);
+        uhid->frm = NULL;
+        return U2F_ERR_INVALID_SEQ;
+    }
+
+    memcpy(&uhid->frm->pkt.cmd.buf[uhid->len], seq->buf, len);
+    uhid->len += len;
+
+    return U2F_ERR_SUCCESS;
 }
 
 static int
 on_io(sd_event_source *s, int fd, uint32_t revents, void *userdata)
 {
+    uint8_t err = U2F_ERR_OTHER;
     u2f_uhid *uhid = userdata;
     struct uhid_event ue = {};
-    hid_frm *hid = (hid_frm *) ue.u.output.data;
-    channel *chl = NULL;
+    hid_frm *hid = NULL;
 
     if (read(fd, &ue, sizeof(ue)) != sizeof(ue))
         return -errno;
@@ -84,120 +260,29 @@ on_io(sd_event_source *s, int fd, uint32_t revents, void *userdata)
     if (ue.type != UHID_OUTPUT)
         return 0;
 
-    if (ue.u.output.size < sizeof(*hid) - sizeof(hid->frm.pkt.cmd.len))
+    if (ue.u.output.size < offsetof(hid_frm, frm.pkt.seq.buf))
         return 0;
 
-    for (u2f_list *l = uhid->chls.nxt; l != &uhid->chls; l = l->nxt) {
-        channel *c = u2f_list_itm(channel, lst, l);
-        if (c->frm->cid == hid->frm.cid)
-            chl = c;
-    }
+    hid = (hid_frm *) ue.u.output.data;
+    u2f_frm_dump(&hid->frm, ue.u.output.size, ">U ");
 
-    if (hid->frm.pkt.cmd.cmd & U2F_CMD) {
-        if (ue.u.output.size < sizeof(*hid)) {
-            (void) u2f_uhid_error(uhid, hid->frm.cid, U2F_ERR_INVALID_LEN);
-            return 0;
-        }
+    if (hid->frm.pkt.cmd.cmd & U2F_CMD)
+        err = on_cmd(uhid, hid->frm.cid, &hid->frm.pkt.cmd,
+                     ue.u.output.size - offsetof(hid_frm, frm.pkt.cmd.buf));
+    else
+        err = on_seq(uhid, hid->frm.cid, &hid->frm.pkt.seq,
+                     ue.u.output.size - offsetof(hid_frm, frm.pkt.seq.buf));
 
-        if (chl) {
-            (void) u2f_uhid_error(uhid, hid->frm.cid, U2F_ERR_OTHER);
-            channel_free(chl);
-        }
+    if (err != U2F_ERR_SUCCESS)
+        return send_reply(sd_event_source_get_io_fd(s), hid->frm.cid,
+                          u2f_cmd_mkerr(err));
 
-        chl = calloc(1, sizeof(*chl));
-        if (!chl) {
-            (void) u2f_uhid_error(uhid, hid->frm.cid, U2F_ERR_OTHER);
-            channel_free(chl);
-            return 0;
-        }
-
-        u2f_list_new(&chl->lst);
-
-        chl->len = ue.u.output.size - sizeof(*hid);
-        if (chl->len > be16toh(hid->frm.pkt.cmd.len))
-            chl->len = be16toh(hid->frm.pkt.cmd.len);
-
-        u2f_frm_dump(">U ", &hid->frm, sizeof(u2f_frm) + chl->len);
-
-        chl->frm = calloc(1, sizeof(hid->frm) + be16toh(hid->frm.pkt.cmd.len));
-        if (!chl->frm) {
-            (void) u2f_uhid_error(uhid, hid->frm.cid, U2F_ERR_OTHER);
-            channel_free(chl);
-            return 0;
-        }
-
-        memcpy(chl->frm, &hid->frm, sizeof(u2f_frm) + chl->len);
-        u2f_list_app(&uhid->chls, &chl->lst);
-    } else if (chl) {
-        const uint16_t len = ue.u.output.size - offsetof(hid_frm, frm.pkt.seq.buf);
-        const uint16_t rem = be16toh(chl->frm->pkt.cmd.len) - chl->len;
-        const uint16_t tot = len < rem ? len : rem;
-
-        u2f_frm_dump(">U ", &hid->frm, tot + offsetof(u2f_frm, pkt.seq.buf));
-
-        if (hid->frm.pkt.seq.seq != chl->seq) {
-            (void) u2f_uhid_error(uhid, hid->frm.cid, U2F_ERR_INVALID_SEQ);
-            channel_free(chl);
-            return 0;
-        }
-
-        memcpy(&chl->frm->pkt.cmd.buf[chl->len], hid->frm.pkt.seq.buf, tot);
-        chl->len += tot;
-        chl->seq++;
-    } else {
-        (void) u2f_uhid_error(uhid, hid->frm.cid, U2F_ERR_INVALID_CID);
+    if (!uhid->frm || uhid->len < be16toh(uhid->frm->pkt.cmd.len))
         return 0;
-    }
 
-    // If the message is complete...
-    if (chl->len == be16toh(chl->frm->pkt.cmd.len)) {
-        // Handle INIT commands internally.
-        if (chl->frm->cid == U2F_CID_BROADCAST) {
-            u2f_frm *msg = alloca(sizeof(u2f_frm) + sizeof(u2f_cmd_rep_init));
-            u2f_cmd_req_init *req = (u2f_cmd_req_init *) chl->frm->pkt.cmd.buf;
-            u2f_cmd_rep_init *rep = (u2f_cmd_rep_init *) msg->pkt.cmd.buf;
-
-            if (chl->frm->pkt.cmd.cmd != U2F_CMD_INIT) {
-                (void) u2f_uhid_error(uhid, hid->frm.cid, U2F_ERR_INVALID_CMD);
-                channel_free(chl);
-                return 0;
-            }
-
-            if (be16toh(chl->frm->pkt.cmd.len) != sizeof(u2f_cmd_req_init)) {
-                (void) u2f_uhid_error(uhid, hid->frm.cid, U2F_ERR_INVALID_LEN);
-                channel_free(chl);
-                return 0;
-            }
-
-            while (uhid->cid == U2F_CID_RESERVED ||
-                   uhid->cid == U2F_CID_BROADCAST)
-                uhid->cid++;
-
-            msg->cid = U2F_CID_BROADCAST;
-            msg->pkt.cmd.cmd = U2F_CMD_INIT;
-            msg->pkt.cmd.len = htobe16(sizeof(u2f_cmd_rep_init));
-            rep->non = req->non;
-            rep->cid = uhid->cid;
-            rep->ver = DEV_HID_VER;
-            rep->maj = DEV_VER_MAJ;
-            rep->min = DEV_VER_MIN;
-            rep->bld = DEV_VER_BLD;
-            rep->cap = 0x00;
-
-            (void) u2f_uhid_send(uhid, msg);
-            channel_free(chl);
-            return 0;
-        } else if (chl->frm->pkt.cmd.cmd == U2F_CMD_INIT) {
-            (void) u2f_uhid_error(uhid, hid->frm.cid, U2F_ERR_INVALID_CMD);
-            channel_free(chl);
-            return 0;
-        }
-
-        uhid->cb(chl->frm, uhid->misc);
-        channel_free(chl);
-        return 0;
-    }
-
+    uhid->cbk(&uhid->frm->pkt.cmd, uhid->msc);
+    sd_event_source_unref(uhid->out);
+    uhid->out = NULL;
     return 0;
 }
 
@@ -207,20 +292,18 @@ u2f_uhid_free(u2f_uhid *uhid)
     if (!uhid)
         return;
 
-    if (uhid->src) {
+    if (uhid->src)
         close(sd_event_source_get_io_fd(uhid->src));
-        sd_event_source_unref(uhid->src);
-    }
 
-    while (uhid->chls.nxt != &uhid->chls)
-        channel_free(u2f_list_itm(channel, lst, &uhid->chls.nxt));
-
+    sd_event_source_unref(uhid->src);
+    sd_event_source_unref(uhid->out);
+    free(uhid->frm);
     free(uhid);
 }
 
 u2f_uhid *
 u2f_uhid_new(const char *name, const char *phys, const char *uniq,
-             u2f_uhid_cb *cb, void *misc)
+             u2f_uhid_cbk *cbk, void *msc)
 {
     sd_event __attribute__((cleanup(sd_event_unrefp))) *evt = NULL;
     u2f_uhid *uhid = NULL;
@@ -267,9 +350,8 @@ u2f_uhid_new(const char *name, const char *phys, const char *uniq,
     if (!uhid)
         return NULL;
 
-    u2f_list_new(&uhid->chls);
-    uhid->misc = misc;
-    uhid->cb = cb;
+    uhid->msc = msc;
+    uhid->cbk = cbk;
 
     fd = open("/dev/uhid", O_RDWR);
     if (fd < 0)
@@ -296,64 +378,15 @@ error:
 }
 
 int
-u2f_uhid_enable(u2f_uhid *uhid, bool enable)
+u2f_uhid_send(u2f_uhid *uhid, const u2f_cmd *cmd)
 {
-    int arg = enable ? SD_EVENT_ON : SD_EVENT_OFF;
-    return sd_event_source_set_enabled(uhid->src, arg);
-}
+    int r;
 
-int
-#undef u2f_uhid_send
-u2f_uhid_send(const u2f_uhid *uhid, const u2f_frm *frm,
-              const char *file, int line)
-{
-    const size_t len = sizeof(*frm) + be16toh(frm->pkt.cmd.len);
-    struct uhid_event ue = { .type = UHID_INPUT2 };
-    int fd = sd_event_source_get_io_fd(uhid->src);
-    u2f_frm *msg = (u2f_frm *) ue.u.input2.data;
-    size_t off;
+    if (!uhid->frm)
+        return -ENOENT;
 
-    off = ue.u.input2.size = len < HID_FRME ? len : HID_FRME;
-    memcpy(ue.u.input2.data, frm, off);
-
-    if (frm->pkt.cmd.cmd != U2F_CMD_KEEPALIVE)
-        u2f_frm_dump("<U ", msg, ue.u.input2.size);
-
-    if (write(fd, &ue, sizeof(ue)) != sizeof(ue))
-        return -errno;
-
-    for (msg->pkt.seq.seq = 0; off < len; msg->pkt.seq.seq++) {
-        const size_t rem = len - off + offsetof(u2f_frm, pkt.seq.buf);
-        const size_t src = off - offsetof(u2f_frm, pkt.cmd.buf);
-        size_t cnt;
-
-        ue.u.input2.size = rem < HID_FRME ? rem : HID_FRME;
-        cnt = ue.u.input2.size - offsetof(u2f_frm, pkt.seq.buf);
-
-        memcpy(msg->pkt.seq.buf, &frm->pkt.cmd.buf[src], cnt);
-        off += cnt;
-
-        if (frm->pkt.cmd.cmd != U2F_CMD_KEEPALIVE)
-            u2f_frm_dump("<U ", msg, ue.u.input2.size);
-
-        if (write(fd, &ue, sizeof(ue)) != sizeof(ue))
-            return -errno;
-    }
-
-    return len;
-}
-
-int
-#undef u2f_uhid_error
-u2f_uhid_error(const u2f_uhid *uhid, uint32_t cid, uint8_t err,
-               const char *file, int line)
-{
-    u2f_frm *frm = alloca(sizeof(*frm) + sizeof(err));
-
-    frm->cid = cid;
-    frm->pkt.cmd.cmd = U2F_CMD_ERROR;
-    frm->pkt.cmd.len = 1;
-    frm->pkt.cmd.buf[0] = err;
-
-    return u2f_uhid_send(uhid, frm, file, line);
+    r = send_reply(sd_event_source_get_io_fd(uhid->src), uhid->frm->cid, cmd);
+    free(uhid->frm);
+    uhid->frm = NULL;
+    return r;
 }

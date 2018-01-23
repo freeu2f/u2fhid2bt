@@ -19,16 +19,18 @@
 
 #include "gatt.h"
 #include "uhid.h"
-#include "list.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
+
+#include <systemd/sd-bus.h>
+
+#define GATT_CHARACTERISTIC "org.bluez.GattCharacteristic1"
+#define TIMEOUT_SECONDS 15
 
 #define CNT(v) (sizeof((v)) / sizeof(*(v)))
-
-#define sd_bus_message_auto \
-    sd_bus_message __attribute__((cleanup(sd_bus_message_unrefp)))
 
 #define MATCH \
     "type='signal',sender='org.bluez',member='PropertiesChanged'," \
@@ -38,7 +40,7 @@
 static const struct {
     const char *uuid;
     const char *name;
-} props[] = {
+} chrs[] = {
     { "f1d0fff1-deaa-ecee-b42f-c9ba7ed623bb", "u2fControlPoint" },
     { "f1d0fff2-deaa-ecee-b42f-c9ba7ed623bb", "u2fStatus" },
     { "f1d0fff3-deaa-ecee-b42f-c9ba7ed623bb", "u2fControlPointLength" },
@@ -46,121 +48,139 @@ static const struct {
     { "f1d0fff4-deaa-ecee-b42f-c9ba7ed623bb", "u2fServiceRevisionBitfield" },
 };
 
-struct u2f_gatt {
-    char         *svc;             /* Service (D-Bus Object Path) */
-    char         *chr[CNT(props)]; /* Characteristics (D-Bus Object Paths) */
-
-    sd_bus       *bus;
-    sd_bus_slot  *slt;
-
-    u2f_gatt_cbk *cbk;
-    void         *msc;
-
-    u2f_frm      *frm;
-    size_t        len;
-    uint32_t      cid;
+struct io {
+    u2f_cmd *cmd; /* The incoming or outgoing command */
+    size_t   len; /* Bytes of the frame already sent/received */
+    uint8_t  seq; /* Sequence counter for continuations */
 };
 
-static int
-write_chr(sd_bus *bus, const char *chr, const void *buf, size_t len)
+struct send {
+    struct io        req; /* Outgoing request state */
+    struct io        rep; /* Incoming request state */
+    sd_bus_slot     *slt; /* Current outstanding method call */
+    uint16_t         mtu; /* BT MTU (cached) */
+    sd_event_source *out; /* Timeout event */
+};
+
+struct u2f_gatt {
+    char         *svc;            /* Service (D-Bus Object Path) */
+    char         *chr[CNT(chrs)]; /* Characteristics (D-Bus Object Paths) */
+
+    sd_bus_slot  *flt;            /* Filter to catch incoming packets from BT */
+
+    u2f_gatt_cbk *cbk;            /* Response callback */
+    void         *msc;            /* Misc. data */
+
+    struct send   snd;            /* State for the current send operation */
+};
+
+static void
+cleanup_send(u2f_gatt *gatt)
 {
-    sd_bus_message_auto *msg = NULL;
-    int r;
+    const char *obj = NULL;
 
-    r = sd_bus_message_new_method_call(bus, &msg, "org.bluez", chr,
-                                       "org.bluez.GattCharacteristic1",
-                                       "WriteValue");
-    if (r < 0)
-        return r;
+    obj = u2f_gatt_get(gatt, "u2fStatus");
+    if (obj) {
+        sd_bus_call_method_async(sd_bus_slot_get_bus(gatt->flt), NULL,
+                                 "org.bluez", obj, GATT_CHARACTERISTIC,
+                                 "StopNotify", NULL, NULL, NULL);
+    }
 
-    r = sd_bus_message_append_array(msg, 'y', buf, len);
-    if (r < 0)
-        return r;
-
-    r = sd_bus_message_append(msg, "a{sv}", 0);
-    if (r < 0)
-        return r;
-
-    return sd_bus_call(bus, msg, 0, NULL, NULL);
+    sd_event_source_unref(gatt->snd.out);
+    sd_bus_slot_unref(gatt->snd.slt);
+    free(gatt->snd.req.cmd);
+    free(gatt->snd.rep.cmd);
+    memset(&gatt->snd, 0, sizeof(gatt->snd));
 }
 
 static int
-get_mtu(const u2f_gatt *gatt)
+on_timeout(sd_event_source *s, uint64_t usec, void *userdata)
 {
-    sd_bus_message_auto *msg = NULL;
-    const uint16_t *mtu = NULL;
-    const char *chr = NULL;
-    size_t size = 0;
-    int r;
+    u2f_gatt *gatt = userdata;
+    if (gatt->snd.req.cmd)
+        gatt->cbk(u2f_cmd_mkerr(U2F_ERR_MSG_TIMEOUT), gatt->msc);
+    cleanup_send(gatt);
+    return 0;
+}
 
-    chr = u2f_gatt_get(gatt, "u2fControlPointLength");
-    if (!chr)
-        return -ENOENT;
+static sd_event_source *
+start_timer(u2f_gatt *gatt, sd_event *evt)
+{
+    sd_event_source *out = NULL;
+    uint64_t usec = 0;
 
-    r = sd_bus_call_method(gatt->bus, "org.bluez", chr,
-                           "org.bluez.GattCharacteristic1", "ReadValue",
-                           NULL, &msg, "a{sv}", 0);
-    if (r < 0)
-        return r;
+    if (sd_event_now(evt, CLOCK_MONOTONIC, &usec) < 0)
+        return NULL;
 
-    r = sd_bus_message_read_array(msg, 'y', (const void **) &mtu, &size);
-    if (r < 0)
-        return r;
+    usec += TIMEOUT_SECONDS * 1000000;
+    if (sd_event_add_time(evt, &out, CLOCK_MONOTONIC, usec, 1,
+                          on_timeout, gatt) < 0)
+        return NULL;
 
-    if (size != sizeof(*mtu))
-        return -EMSGSIZE;
-
-    return be16toh(*mtu);
+    return out;
 }
 
 static void
 on_sts_bytes(u2f_gatt *gatt, const void *buf, size_t len)
 {
     size_t off = offsetof(u2f_pkt, seq.buf);
+    struct io *rep = &gatt->snd.rep;
     const uint8_t *src = buf;
     const u2f_pkt *pkt = buf;
-    size_t rem;
-    size_t tot;
 
-    fprintf(stderr, ">G %08X ", gatt->cid);
-    u2f_pkt_dump("", pkt, len);
-
-    if (gatt->cid == U2F_CID_RESERVED || gatt->cid == U2F_CID_BROADCAST)
+    if (!gatt->snd.req.cmd ||
+        gatt->snd.req.len < be16toh(gatt->snd.req.cmd->len))
         return;
 
+    u2f_pkt_dump(pkt, len, ">G ........ ");
+
     if (pkt->cmd.cmd & U2F_CMD) {
-        if (gatt->frm || len < sizeof(pkt->cmd))
+        if (rep->cmd || len < sizeof(u2f_cmd))
             goto error;
 
-        gatt->frm = calloc(1, sizeof(u2f_frm) + be16toh(pkt->cmd.len));
-        if (!gatt->frm)
+        rep->cmd = calloc(1, sizeof(u2f_cmd) + be16toh(pkt->cmd.len));
+        if (!rep->cmd)
             goto error;
 
-        gatt->frm->cid = gatt->cid;
-        gatt->frm->pkt = *pkt;
-        gatt->len = 0;
+        *rep->cmd = pkt->cmd;
+        rep->len = 0;
 
         off = offsetof(u2f_pkt, cmd.buf);
-    } else if (!gatt->frm || len < sizeof(pkt->seq))
+    } else if (!rep->cmd || len <= sizeof(u2f_seq) || pkt->seq.seq != rep->seq++)
         goto error;
 
-    rem = be16toh(gatt->frm->pkt.cmd.len) - gatt->len;
-    tot = ((len - off) < rem) ? len - off : rem;
+    len -= off;
+    if (len > be16toh(rep->cmd->len) - rep->len)
+        len = be16toh(rep->cmd->len) - rep->len;
 
-    memcpy(&gatt->frm->pkt.cmd.buf[gatt->len], &src[off], tot);
-    gatt->len += tot;
+    memcpy(&rep->cmd->buf[rep->len], &src[off], len);
+    rep->len += len;
 
-    if (gatt->len == be16toh(gatt->frm->pkt.cmd.len)) {
-        gatt->cbk(gatt->frm, gatt->msc);
-        goto error;
+    if (rep->len < be16toh(rep->cmd->len))
+        return;
+
+    /* Ignore keepalive packets and reset timeout. */
+    if (rep->cmd->cmd == U2F_CMD_KEEPALIVE) {
+        sd_event_source *out = NULL;
+
+        free(rep->cmd);
+        memset(rep, 0, sizeof(*rep));
+
+        out = start_timer(gatt, sd_event_source_get_event(gatt->snd.out));
+        if (out) {
+            sd_event_source_unref(gatt->snd.out);
+            gatt->snd.out = out;
+        }
+
+        return;
     }
 
+    gatt->cbk(rep->cmd, gatt->msc);
+    cleanup_send(gatt);
     return;
 
 error:
-    free(gatt->frm);
-    gatt->frm = NULL;
-    gatt->cid = U2F_CID_RESERVED;
+    u2f_gatt_cancel(gatt);
 }
 
 static int
@@ -218,23 +238,171 @@ on_sts_notify(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
     return 0;
 }
 
+static int
+on_write(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
+{
+    sd_bus_message *msg = NULL;
+    u2f_gatt *gatt = userdata;
+    const char *obj = NULL;
+    u2f_seq *seq = NULL;
+    size_t len = 0;
+
+    sd_bus_slot_unref(gatt->snd.slt);
+    gatt->snd.slt = NULL;
+
+    if (sd_bus_error_is_set(ret_error))
+        goto error;
+
+    len = be16toh(gatt->snd.req.cmd->len) - gatt->snd.req.len;
+    if (len > gatt->snd.mtu - sizeof(u2f_seq))
+        len = gatt->snd.mtu - sizeof(u2f_seq);
+
+    if (len == 0)
+        return 0;
+
+    obj = u2f_gatt_get(gatt, "u2fControlPoint");
+    if (!obj)
+        goto error;
+
+    seq = alloca(sizeof(u2f_seq) + len);
+    seq->seq = gatt->snd.req.seq++;
+    memcpy(seq->buf, &gatt->snd.req.cmd->buf[gatt->snd.req.len], len);
+    gatt->snd.req.len += len;
+
+    u2f_seq_dump(seq, sizeof(u2f_seq) + len, "<G ........ ");
+
+    if (sd_bus_message_new_method_call(sd_bus_message_get_bus(m), &msg,
+                                       "org.bluez", obj, GATT_CHARACTERISTIC,
+                                       "WriteValue") < 0)
+        goto error;
+
+    if (sd_bus_message_append_array(msg, 'y', seq, sizeof(u2f_seq) + len) < 0)
+        goto error;
+
+    if (sd_bus_message_append(msg, "a{sv}", 0) < 0)
+        goto error;
+
+    if (sd_bus_call_async(sd_bus_message_get_bus(m), &gatt->snd.slt, msg,
+                          on_write, gatt, 0) < 0)
+        goto error;
+
+    sd_bus_message_unref(msg);
+    return 0;
+
+error:
+    sd_bus_message_unref(msg);
+    u2f_gatt_cancel(gatt);
+    return 0;
+}
+
+static int
+on_mtu(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
+{
+    sd_bus_message *msg = NULL;
+    const uint16_t *mtu = NULL;
+    u2f_gatt *gatt = userdata;
+    const char *obj = NULL;
+    size_t size = 0;
+
+    sd_bus_slot_unref(gatt->snd.slt);
+    gatt->snd.slt = NULL;
+
+    if (sd_bus_error_is_set(ret_error))
+        goto error;
+
+    if (sd_bus_message_read_array(m, 'y', (const void **) &mtu, &size) < 0)
+        goto error;
+
+    if (size != sizeof(*mtu))
+        goto error;
+
+    gatt->snd.mtu = be16toh(*mtu);
+    if (gatt->snd.mtu <= sizeof(u2f_cmd) || gatt->snd.mtu > 4096)
+        goto error;
+
+    gatt->snd.req.len = be16toh(gatt->snd.req.cmd->len);
+    if (gatt->snd.req.len > gatt->snd.mtu - sizeof(u2f_cmd))
+        gatt->snd.req.len = gatt->snd.mtu - sizeof(u2f_cmd);
+
+    obj = u2f_gatt_get(gatt, "u2fControlPoint");
+    if (!obj)
+        goto error;
+
+    u2f_cmd_dump(gatt->snd.req.cmd, sizeof(u2f_cmd) + gatt->snd.req.len,
+                 "<G ........ ");
+
+    if (sd_bus_message_new_method_call(sd_bus_message_get_bus(m), &msg,
+                                       "org.bluez", obj, GATT_CHARACTERISTIC,
+                                       "WriteValue") < 0)
+        goto error;
+
+    if (sd_bus_message_append_array(msg, 'y', gatt->snd.req.cmd,
+                                    sizeof(u2f_cmd) + gatt->snd.req.len) < 0)
+        goto error;
+
+    if (sd_bus_message_append(msg, "a{sv}", 0) < 0)
+        goto error;
+
+    if (sd_bus_call_async(sd_bus_message_get_bus(m), &gatt->snd.slt, msg,
+                          on_write, gatt, 0) < 0)
+        goto error;
+
+    sd_bus_message_unref(msg);
+    return 0;
+
+error:
+    sd_bus_message_unref(msg);
+    u2f_gatt_cancel(gatt);
+    return 0;
+}
+
+static int
+on_notify(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
+{
+    u2f_gatt *gatt = userdata;
+    const char *obj = NULL;
+
+    sd_bus_slot_unref(gatt->snd.slt);
+    gatt->snd.slt = NULL;
+
+    if (sd_bus_error_is_set(ret_error))
+        goto error;
+
+    obj = u2f_gatt_get(gatt, "u2fControlPointLength");
+    if (!obj)
+        goto error;
+
+    if (sd_bus_call_method_async(sd_bus_message_get_bus(m), &gatt->snd.slt,
+                                 "org.bluez", obj, GATT_CHARACTERISTIC,
+                                 "ReadValue", on_mtu, gatt, "a{sv}", 0) < 0)
+        goto error;
+
+    return 0;
+
+error:
+    u2f_gatt_cancel(gatt);
+    return 0;
+}
+
 void
 u2f_gatt_free(u2f_gatt *gatt)
 {
     if (!gatt)
         return;
 
+    u2f_gatt_cancel(gatt);
+
     free(gatt->svc);
 
-    for (size_t i = 0; i < CNT(props); i++)
+    for (size_t i = 0; i < CNT(chrs); i++)
         free(gatt->chr[i]);
 
-    sd_bus_slot_unref(gatt->slt);
-    sd_bus_unref(gatt->bus);
+    sd_bus_slot_unref(gatt->flt);
+    free(gatt);
 }
 
 u2f_gatt *
-u2f_gatt_new(sd_bus *bus, const char *svc, u2f_gatt_cbk *cbk, void *msc)
+u2f_gatt_new(const char *svc, u2f_gatt_cbk *cbk, void *msc)
 {
     u2f_gatt *gatt = NULL;
 
@@ -248,7 +416,6 @@ u2f_gatt_new(sd_bus *bus, const char *svc, u2f_gatt_cbk *cbk, void *msc)
         return NULL;
     }
 
-    gatt->bus = sd_bus_ref(bus);
     gatt->msc = msc;
     gatt->cbk = cbk;
     return gatt;
@@ -263,41 +430,50 @@ u2f_gatt_svc(const u2f_gatt *gatt)
 int
 u2f_gatt_set(u2f_gatt *gatt, const char *id, const char *obj)
 {
-    for (size_t i = 0; i < CNT(props); i++) {
-        if (strcmp(id, props[i].name) == 0 ||
-            strcasecmp(id, props[i].uuid) == 0) {
-            char *tmp = NULL;
+    for (size_t i = 0; i < CNT(chrs); i++) {
+        char *tmp = NULL;
 
-            if (strcmp(props[i].name, "u2fStatus") == 0) {
-                char *match = NULL;
-                int r;
+        if (strcmp(id, chrs[i].name) != 0 && strcasecmp(id, chrs[i].uuid) != 0)
+            continue;
 
-                r = asprintf(&match, MATCH, obj);
-                if (r < 0)
-                    return -errno;
+        u2f_gatt_cancel(gatt);
 
-                if (gatt->slt) {
-                    sd_bus_slot_unref(gatt->slt);
-                    gatt->slt = NULL;
-                }
+        if (strcmp(chrs[i].name, "u2fStatus") == 0) {
+            sd_bus *bus = NULL;
+            char *match = NULL;
+            int r;
 
-                r = sd_bus_add_match(gatt->bus, &gatt->slt, match,
-                                     on_sts_notify, gatt);
+            r = asprintf(&match, MATCH, obj);
+            if (r < 0)
+                return -errno;
+
+            if (gatt->flt) {
+                sd_bus_slot_unref(gatt->flt);
+                gatt->flt = NULL;
+            }
+
+            r = sd_bus_default_system(&bus);
+            if (r < 0) {
                 free(match);
-                if (r < 0)
-                    return r;
+                return r;
             }
 
-            if (obj) {
-                tmp = strdup(obj);
-                if (!tmp)
-                    return -ENOMEM;
-            }
-
-            free(gatt->chr[i]);
-            gatt->chr[i] = tmp;
-            return 0;
+            r = sd_bus_add_match(bus, &gatt->flt, match, on_sts_notify, gatt);
+            sd_bus_unref(bus);
+            free(match);
+            if (r < 0)
+                return r;
         }
+
+        if (obj) {
+            tmp = strdup(obj);
+            if (!tmp)
+                return -ENOMEM;
+        }
+
+        free(gatt->chr[i]);
+        gatt->chr[i] = tmp;
+        return 0;
     }
 
     return -ENOENT;
@@ -306,9 +482,9 @@ u2f_gatt_set(u2f_gatt *gatt, const char *id, const char *obj)
 const char *
 u2f_gatt_has(u2f_gatt *gatt, const char *obj)
 {
-    for (size_t i = 0; i < CNT(props); i++) {
+    for (size_t i = 0; i < CNT(chrs); i++) {
         if (gatt->chr[i] && strcmp(gatt->chr[i], obj) == 0)
-            return props[i].name;
+            return chrs[i].name;
     }
 
     return NULL;
@@ -317,78 +493,59 @@ u2f_gatt_has(u2f_gatt *gatt, const char *obj)
 const char *
 u2f_gatt_get(const u2f_gatt *gatt, const char *id)
 {
-    for (size_t i = 0; i < CNT(props); i++) {
-        if (strcmp(id, props[i].name) == 0 ||
-            strcasecmp(id, props[i].uuid) == 0)
+    for (size_t i = 0; i < CNT(chrs); i++) {
+        if (strcmp(id, chrs[i].name) == 0 || strcasecmp(id, chrs[i].uuid) == 0)
             return gatt->chr[i];
     }
 
     return NULL;
 }
 
-int
-u2f_gatt_send(u2f_gatt *gatt, const u2f_frm *frm)
+void
+u2f_gatt_cancel(u2f_gatt *gatt)
 {
-    const size_t len = sizeof(frm->pkt) + be16toh(frm->pkt.cmd.len);
-    sd_bus_message_auto *msg = NULL;
-    const char *pnt = NULL;
-    const char *sts = NULL;
-    u2f_seq *seq = NULL;
-    int mtu = 0;
-    int r = 0;
+    if (gatt->snd.req.cmd)
+        gatt->cbk(u2f_cmd_mkerr(U2F_ERR_OTHER), gatt->msc);
 
-    pnt = u2f_gatt_get(gatt, "u2fControlPoint");
-    if (!pnt)
-        return -ENOENT;
+    cleanup_send(gatt);
+}
 
-    sts = u2f_gatt_get(gatt, "u2fStatus");
-    if (!sts)
-        return -ENOENT;
+void
+u2f_gatt_send(u2f_gatt *gatt, const u2f_cmd *cmd)
+{
+    const char *obj = NULL;
+    sd_event *evt = NULL;
 
-    mtu = get_mtu(gatt);
-    fprintf(stderr, "MTU: %d\n", mtu);
-    if (mtu < 0)
-        return mtu;
-    else if (mtu <= sizeof(*seq) || mtu > 4096)
-        return -EMSGSIZE;
+    obj = u2f_gatt_get(gatt, "u2fStatus");
+    if (!obj)
+        goto error;
 
-    r = sd_bus_message_new_method_call(gatt->bus, &msg, "org.bluez", sts,
-                                       "org.bluez.GattCharacteristic1",
-                                       "StartNotify");
-    if (r < 0)
-        return r;
+    u2f_gatt_cancel(gatt);
 
-    r = sd_bus_call(gatt->bus, msg, 0, NULL, NULL);
-    if (r < 0)
-        return r;
+    gatt->snd.req.cmd = malloc(sizeof(u2f_cmd) + be16toh(cmd->len));
+    if (!gatt->snd.req.cmd)
+        goto error;
 
-    fprintf(stderr, "<G %08u ", frm->cid);
-    u2f_pkt_dump("", &frm->pkt, mtu < len ? mtu : len);
+    memcpy(gatt->snd.req.cmd, cmd, sizeof(u2f_cmd) + be16toh(cmd->len));
 
-    r = write_chr(gatt->bus, pnt, &frm->pkt, mtu < len ? mtu : len);
-    if (r < 0)
-        return r;
+    if (sd_event_default(&evt) < 0)
+        goto error;
 
-    seq = alloca(mtu);
-    seq->seq = 0;
+    gatt->snd.out = start_timer(gatt, evt);
+    if (!gatt->snd.out)
+        goto error;
 
-    for (size_t off = mtu; off < len; seq->seq++, off += mtu - sizeof(*seq)) {
-        size_t rem = len - off + sizeof(*seq);
-        size_t cnt = rem < mtu ? rem : mtu;
-        memcpy(seq->buf, &frm->pkt.cmd.buf[off - sizeof(frm->pkt)],
-               cnt - sizeof(*seq));
+    if (sd_bus_call_method_async(sd_bus_slot_get_bus(gatt->flt),
+                                 &gatt->snd.slt, "org.bluez", obj,
+                                 GATT_CHARACTERISTIC, "StartNotify",
+                                 on_notify, gatt, "") < 0)
+        goto error;
 
-        fprintf(stderr, "<G %08u ", frm->cid);
-        u2f_seq_dump("", seq, cnt);
+    sd_event_unref(evt);
+    return;
 
-        r = write_chr(gatt->bus, pnt, seq, cnt);
-        if (r < 0)
-            return r;
-    }
-
-    gatt->cid = frm->cid;
-    free(gatt->frm);
-    gatt->frm = NULL;
-
-    return len;
+error:
+    gatt->cbk(u2f_cmd_mkerr(U2F_ERR_OTHER), gatt->msc);
+    cleanup_send(gatt);
+    sd_event_unref(evt);
 }

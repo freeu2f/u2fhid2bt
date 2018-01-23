@@ -21,29 +21,15 @@
 
 #include <stdbool.h>
 
-#include <systemd/sd-bus.h>
-
 typedef struct u2f_uhid u2f_uhid;
-typedef void (u2f_uhid_cb)(const u2f_frm *frm, void *misc);
+typedef void (u2f_uhid_cbk)(const u2f_cmd *cmd, void *msc);
 
 void
 u2f_uhid_free(u2f_uhid *uhid);
 
 u2f_uhid *
 u2f_uhid_new(const char *name, const char *phys, const char *uniq,
-             u2f_uhid_cb *cb, void *misc);
+             u2f_uhid_cbk *cbk, void *msc);
 
 int
-u2f_uhid_enable(u2f_uhid *uhid, bool enable);
-
-int
-u2f_uhid_send(const u2f_uhid *uhid, const u2f_frm *frm,
-             const char *file, int line);
-#define u2f_uhid_send(uhid, frm) \
-    u2f_uhid_send(uhid, frm, __FILE__, __LINE__)
-
-int
-u2f_uhid_error(const u2f_uhid *uhid, uint32_t cid, uint8_t err,
-               const char *file, int line);
-#define u2f_uhid_error(uhid, cid, err) \
-    u2f_uhid_error(uhid, cid, err, __FILE__, __LINE__)
+u2f_uhid_send(u2f_uhid *uhid, const u2f_cmd *cmd);

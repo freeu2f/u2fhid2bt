@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <alloca.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -85,13 +86,17 @@ typedef struct __attribute__((packed)) {
 } u2f_cmd_rep_init;
 
 void
-u2f_cmd_dump(const char *prfx, const u2f_cmd *cmd, size_t len);
+u2f_cmd_dump(const u2f_cmd *cmd, size_t len, const char *prfx, ...);
 
 void
-u2f_seq_dump(const char *prfx, const u2f_seq *seq, size_t len);
+u2f_seq_dump(const u2f_seq *seq, size_t len, const char *prfx, ...);
 
 void
-u2f_pkt_dump(const char *prfx, const u2f_pkt *pkt, size_t len);
+u2f_pkt_dump(const u2f_pkt *pkt, size_t len, const char *prfx, ...);
 
 void
-u2f_frm_dump(const char *prfx, const u2f_frm *frm, size_t len);
+u2f_frm_dump(const u2f_frm *frm, size_t len, const char *prfx, ...);
+
+u2f_cmd *
+u2f_cmd_mkerr(u2f_cmd *cmd, uint8_t err);
+#define u2f_cmd_mkerr(err) u2f_cmd_mkerr(alloca(sizeof(u2f_cmd) + 1), err) 
