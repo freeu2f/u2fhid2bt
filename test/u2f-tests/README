@@ -1,0 +1,5 @@
+These tests come from https://github.com/google/u2f-ref-code/.
+
+We forked them because the repo is huge and we want to run the tests without
+downloading the repo (think: during package builds).
+
