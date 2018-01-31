@@ -264,10 +264,16 @@ on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
     if (r < 0)
         return r;
 
-    while ((r = sd_bus_message_enter_container(m, 'e', "sa{sv}")) > 0) {
+    while (true) {
         const char *parent = NULL;
         const char *iface = NULL;
         const char *info = NULL;
+
+        r = sd_bus_message_enter_container(m, 'e', "sa{sv}");
+        if (r < 0)
+            return r;
+        else if (r == 0)
+            break;
 
         r = sd_bus_message_read(m, "s", &iface);
         if (r < 0)
@@ -277,8 +283,14 @@ on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
         if (r < 0)
             return r;
 
-        while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
+        while (true) {
             const char *prop = NULL;
+
+            r = sd_bus_message_enter_container(m, 'e', "sv");
+            if (r < 0)
+                return r;
+            else if (r == 0)
+                break;
 
             r = sd_bus_message_read(m, "s", &prop);
             if (r < 0)
@@ -321,8 +333,6 @@ on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
         if (r < 0)
             return r;
     }
-    if (r < 0)
-        return r;
 
     r = sd_bus_message_exit_container(m);
     if (r < 0)
@@ -337,10 +347,6 @@ on_svc_iface_rem(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
     const char *path = NULL;
     int r;
 
-    r = sd_bus_message_has_signature(m, "oas");
-    if (r < 0)
-        return r;
-
     r = sd_bus_message_read(m, "o", &path);
     if (r < 0)
         return r;
@@ -349,30 +355,30 @@ on_svc_iface_rem(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
     if (r < 0)
         return r;
 
-    while ((r = sd_bus_message_enter_container(m, 'e', "s")) > 0) {
+    while (true) {
         const char *iface = NULL;
 
         r = sd_bus_message_read(m, "s", &iface);
         if (r < 0)
             return r;
+        else if (r == 0)
+            break;
 
-        r = sd_bus_message_exit_container(m);
-        if (r < 0)
-            return r;
-
-        if (strcmp(iface, "org.bluez.Device1") == 0)
+        if (strcmp(iface, "org.bluez.GattManager1") == 0) {
+            fprintf(stderr, "-%s\n", path);
+        } else if (strcmp(iface, "org.bluez.Device1") == 0) {
+            fprintf(stderr, "-%s\n", path);
             dev_free(dev_find(path));
-        else if (strcmp(iface, "org.bluez.GattService1") == 0)
+        } else if (strcmp(iface, "org.bluez.GattService1") == 0) {
+            fprintf(stderr, "-%s\n", path);
             svc_free(svc_find(path));
-        else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0)
+        } else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0) {
+            fprintf(stderr, "-%s\n", path);
             chr_rem(path);
+        }
     }
 
-    r = sd_bus_message_exit_container(m);
-    if (r < 0)
-        return r;
-
-    return 0;
+    return sd_bus_message_exit_container(m);
 }
 
 static void
