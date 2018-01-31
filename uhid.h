@@ -21,6 +21,11 @@
 
 #include <stdbool.h>
 
+#define UHID_VEND 0xf1d0
+#define UHID_PROD 0xf1d0
+#define UHID_VERS 0
+#define UHID_CTRY 0
+
 typedef struct u2f_uhid u2f_uhid;
 typedef void (u2f_uhid_cbk)(const u2f_cmd *cmd, void *msc);
 

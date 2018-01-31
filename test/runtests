@@ -1,0 +1,84 @@
+#!/bin/bash -e
+
+export BCTL_LOG="bctl.log"
+export BLUE_LOG="blue.log"
+export H2BT_LOG="h2bt.log"
+export TEST_LOG="test.log"
+export DBUS_SOCK="dbus.sock"
+export DBUS_CONF="dbus.conf"
+export DBUS_STARTER_ADDRESS="unix:path=$DBUS_SOCK"
+
+rm -f $BCTL_LOG $BLUE_LOG $H2BT_LOG $TEST_LOG $DBUS_SOCK $DBUS_CONF
+
+if ! [ -r /dev/uhid -a -w /dev/uhid ]; then
+    echo "Missing permissions on /dev/uhid!" >&2
+    exit 1
+fi
+
+function dump_log() {
+    if [ -f $1 ]; then
+        echo "============================== $1 ==============================="
+        tail -n 20 $1
+    fi
+}
+
+function kill_pid() {
+    if [ "$1" ]; then
+        kill $1
+        wait $1 || true
+    fi
+}
+
+function on_exit() {
+    dump_log $BCTL_LOG
+    dump_log $BLUE_LOG
+    dump_log $H2BT_LOG
+    dump_log $TEST_LOG
+
+    kill_pid $H2BT_PID
+    kill_pid $BLUE_PID
+    kill_pid $BCTL_PID
+    kill_pid $DBUS_PID
+
+    rm -f $DBUS_SOCK
+}
+
+trap 'on_exit' EXIT
+trap 'exit' ERR
+
+cat >$DBUS_CONF <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <auth>EXTERNAL</auth>
+  <listen>${DBUS_STARTER_ADDRESS}</listen>
+
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
+
+dbus-daemon --config-file $DBUS_CONF &
+export DBUS_PID=$!
+
+while [ ! -S ${DBUS_SOCK} ]; do
+    sleep 0.01
+done
+
+busctl --address=$DBUS_STARTER_ADDRESS monitor org.bluez >$BCTL_LOG 2>&1 &
+export BCTL_PID=$!
+
+./bluez >$BLUE_LOG 2>&1 &
+export BLUE_PID=$!
+
+./u2fhid2bt >$H2BT_LOG 2>&1 &
+export H2BT_PID=$!
+
+sleep 0.5
+./list >/dev/null
+
+(for dev in `./list`; do ./hidtest $dev; done) >$TEST_LOG 2>&1

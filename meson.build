@@ -1,4 +1,4 @@
-project('u2fhid2bt', 'c')
+project('u2fhid2bt', [ 'c', 'cpp' ])
 
 add_project_arguments([
     '-Wall',
@@ -22,15 +22,41 @@ add_project_arguments([
     '-Wno-sign-compare',
 ], language: 'c')
 
-libsystemd = dependency('libsystemd', version: '>=221')
+libsystemd = dependency('libsystemd', version: '>=237')
+libhidapi = dependency('hidapi-hidraw')
 
-executable('u2fhid2bt',
-    'uhid.c',
-    'uhid.h',
+u2fhid2bt = executable('u2fhid2bt',
     'gatt.c',
     'gatt.h',
     'main.c',
+    'uhid.c',
+    'uhid.h',
+    'u2f.c',
+    'u2f.h',
+    dependencies: libsystemd,
+    install_dir: get_option('libexecdir'),
+    install: true
+)
+
+bluez = executable('bluez',
+    'test/bluez.c',
     'u2f.c',
     'u2f.h',
     dependencies: libsystemd
 )
+
+list = executable('list',
+    'test/list.c',
+    dependencies: libhidapi
+)
+
+hidtest = executable('hidtest',
+    'test/u2f-tests/u2f_util.cc',
+    'test/u2f-tests/u2f_util.h',
+    'test/u2f-tests/HIDTest.cc',
+    'test/u2f-tests/u2f_hid.h',
+    'test/u2f-tests/u2f.h',
+    dependencies: libhidapi
+)
+
+test('tests', find_program('test/runtests'))

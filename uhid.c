@@ -32,20 +32,16 @@
 
 #define TIMEOUT 500000
 
-#define HID_VEND 0
-#define HID_PROD 0
-#define HID_VERS 0
-#define HID_CTRY 0
-#define HID_FRME 64
+#define HID_FRAME 64
 
-#define DEV_HID_VER 2
-#define DEV_VER_MAJ 0
-#define DEV_VER_MIN 0
-#define DEV_VER_BLD 0
+#define HID_DEV_HID_VER 2
+#define HID_DEV_VER_MAJ 0
+#define HID_DEV_VER_MIN 0
+#define HID_DEV_VER_BLD 0
 
-#define MAX_LEN \
-    (HID_FRME - offsetof(u2f_frm, pkt.cmd.buf) + (INT8_MAX + 1) * \
-     (HID_FRME - offsetof(u2f_frm, pkt.seq.buf)))
+#define HID_MAX \
+    (HID_FRAME - offsetof(u2f_frm, pkt.cmd.buf) + (INT8_MAX + 1) * \
+     (HID_FRAME - offsetof(u2f_frm, pkt.seq.buf)))
 
 typedef struct __attribute__((packed)) {
     uint8_t rid; // Report ID (1 byte); See (I think): USB HID 1.11 Section 5.6
@@ -67,19 +63,19 @@ struct u2f_uhid {
 };
 
 static int
-send_frm(int fd, uint32_t cid, u2f_pkt *pkt, size_t hdr,
+send_pkt(int fd, uint32_t cid, u2f_pkt *pkt, size_t hdr,
          const uint8_t *buf, size_t len)
 {
     struct uhid_event ue = { .type = UHID_INPUT2 };
     u2f_frm *frm = (u2f_frm *) ue.u.input2.data;
 
-    if (len > HID_FRME - offsetof(u2f_frm, pkt) - hdr)
-        len = HID_FRME - offsetof(u2f_frm, pkt) - hdr;
+    if (len > HID_FRAME - offsetof(u2f_frm, pkt) - hdr)
+        len = HID_FRAME - offsetof(u2f_frm, pkt) - hdr;
 
     frm->cid = cid;
     frm->pkt = *pkt;
     memcpy(&ue.u.input2.data[offsetof(u2f_frm, pkt) + hdr], buf, len);
-    ue.u.input2.size = HID_FRME;
+    ue.u.input2.size = HID_FRAME;
 
     u2f_frm_dump(frm, offsetof(u2f_frm, pkt) + hdr + len, "<U ");
     return write(fd, &ue, sizeof(ue)) == sizeof(ue) ? len : -errno;
@@ -92,17 +88,17 @@ send_reply(int fd, uint32_t cid, const u2f_cmd *cmd)
     u2f_pkt pkt = {};
     int r;
 
-    if (len > MAX_LEN)
+    if (len > HID_MAX)
         return send_reply(fd, cid, u2f_cmd_mkerr(U2F_ERR_OTHER));
 
     pkt.cmd = *cmd;
-    r = send_frm(fd, cid, &pkt, offsetof(u2f_pkt, cmd.buf), cmd->buf, len);
+    r = send_pkt(fd, cid, &pkt, offsetof(u2f_pkt, cmd.buf), cmd->buf, len);
     if (r < 0)
         return r;
 
     for (size_t off = r, seq = 0; off < len; off += r, seq++) {
         pkt.seq.seq = seq;
-        r = send_frm(fd, cid, &pkt, offsetof(u2f_pkt, seq.buf),
+        r = send_pkt(fd, cid, &pkt, offsetof(u2f_pkt, seq.buf),
                      &cmd->buf[off], len - off);
         if (r < 0)
             return r;
@@ -140,10 +136,10 @@ on_init(u2f_uhid *uhid, uint32_t cid, const u2f_cmd *creq)
     crep->len = htobe16(sizeof(u2f_cmd_rep_init));
     irep->non = ireq->non;
     irep->cid = cid;
-    irep->ver = DEV_HID_VER;
-    irep->maj = DEV_VER_MAJ;
-    irep->min = DEV_VER_MIN;
-    irep->bld = DEV_VER_BLD;
+    irep->ver = HID_DEV_HID_VER;
+    irep->maj = HID_DEV_VER_MAJ;
+    irep->min = HID_DEV_VER_MIN;
+    irep->bld = HID_DEV_VER_BLD;
     irep->cap = 0x00;
 
     while (irep->cid == U2F_CID_BROADCAST || irep->cid == U2F_CID_RESERVED)
@@ -162,10 +158,7 @@ on_cmd(u2f_uhid *uhid, uint32_t cid, const u2f_cmd *cmd, size_t len)
 {
     uint64_t now = 0;
 
-    if (len < offsetof(hid_frm, frm.pkt.cmd.buf))
-        return U2F_ERR_INVALID_LEN;
-
-    if (be16toh(cmd->len) > MAX_LEN)
+    if (be16toh(cmd->len) > HID_MAX)
         return U2F_ERR_INVALID_LEN;
 
     if (len > be16toh(cmd->len))
@@ -260,18 +253,23 @@ on_io(sd_event_source *s, int fd, uint32_t revents, void *userdata)
     if (ue.type != UHID_OUTPUT)
         return 0;
 
-    if (ue.u.output.size < offsetof(hid_frm, frm.pkt.seq.buf))
+    if (ue.u.output.size <= offsetof(hid_frm, frm.pkt.seq.buf))
         return 0;
 
     hid = (hid_frm *) ue.u.output.data;
     u2f_frm_dump(&hid->frm, ue.u.output.size, ">U ");
 
-    if (hid->frm.pkt.cmd.cmd & U2F_CMD)
-        err = on_cmd(uhid, hid->frm.cid, &hid->frm.pkt.cmd,
-                     ue.u.output.size - offsetof(hid_frm, frm.pkt.cmd.buf));
-    else
+    if (hid->frm.pkt.cmd.cmd & U2F_CMD) {
+        if (ue.u.output.size >= sizeof(hid_frm)) {
+            err = on_cmd(uhid, hid->frm.cid, &hid->frm.pkt.cmd,
+                         ue.u.output.size - offsetof(hid_frm, frm.pkt.cmd.buf));
+        } else {
+            err = U2F_ERR_INVALID_LEN;
+        }
+    } else {
         err = on_seq(uhid, hid->frm.cid, &hid->frm.pkt.seq,
                      ue.u.output.size - offsetof(hid_frm, frm.pkt.seq.buf));
+    }
 
     if (err != U2F_ERR_SUCCESS)
         return send_reply(sd_event_source_get_io_fd(s), hid->frm.cid,
@@ -305,7 +303,6 @@ u2f_uhid *
 u2f_uhid_new(const char *name, const char *phys, const char *uniq,
              u2f_uhid_cbk *cbk, void *msc)
 {
-    sd_event __attribute__((cleanup(sd_event_unrefp))) *evt = NULL;
     u2f_uhid *uhid = NULL;
     int fd = -1;
 
@@ -313,10 +310,10 @@ u2f_uhid_new(const char *name, const char *phys, const char *uniq,
         .type = UHID_CREATE2,
         .u.create2 = {
             .bus = BUS_BLUETOOTH, // https://github.com/signal11/hidapi/pull/355
-            .vendor = HID_VEND,
-            .product = HID_PROD,
-            .version = HID_VERS,
-            .country = HID_CTRY,
+            .vendor = UHID_VEND,
+            .product = UHID_PROD,
+            .version = UHID_VERS,
+            .country = UHID_CTRY,
             .rd_size = 36,        // Number of bytes below (KEEP IN SYNC!)
             .rd_data = {
                 0x06, 0xD0, 0xF1, // Usage Page (FIDO_USAGE_PAGE: 0xF1D0)
@@ -326,13 +323,13 @@ u2f_uhid_new(const char *name, const char *phys, const char *uniq,
                 0x15, 0x00,       //   Logical Minimum (0)
                 0x26, 0xFF, 0x00, //   Logical Maximum (255)
                 0x75, 0x08,       //   Report Size (8)
-                0x95, HID_FRME,   //   Report Count (64)
+                0x95, HID_FRAME,  //   Report Count (64)
                 0x81, 0x02,       //   Input (HID_Data | HID_Absolute | HID_Variable)
                 0x09, 0x21,       //   Usage (FIDO_USAGE_DATA_OUT: 33)
                 0x15, 0x00,       //   Logical Minimum (0)
                 0x26, 0xFF, 0x00, //   Logical Maximum (255)
                 0x75, 0x08,       //   Report Size (8)
-                0x95, HID_FRME,   //   Report Count (64)
+                0x95, HID_FRAME,  //   Report Count (64)
                 0x91, 0x02,       //   Output (HID_Data | HID_Absolute | HID_Variable)
                 0xC0,             // End Collection
             },
@@ -342,9 +339,6 @@ u2f_uhid_new(const char *name, const char *phys, const char *uniq,
     strncpy((char *) ue.u.create2.name, name, sizeof(ue.u.create2.name) - 1);
     strncpy((char *) ue.u.create2.phys, phys, sizeof(ue.u.create2.phys) - 1);
     strncpy((char *) ue.u.create2.uniq, uniq, sizeof(ue.u.create2.uniq) - 1);
-
-    if (sd_event_default(&evt) != 0)
-        return NULL;
 
     uhid = calloc(1, sizeof(u2f_uhid));
     if (!uhid)
@@ -357,7 +351,8 @@ u2f_uhid_new(const char *name, const char *phys, const char *uniq,
     if (fd < 0)
         goto error;
 
-    if (sd_event_add_io(evt, &uhid->src, fd, EPOLLIN, on_io, uhid) != 0) {
+    if (sd_event_add_io(SD_EVENT_DEFAULT, &uhid->src, fd,
+                        EPOLLIN, on_io, uhid) != 0) {
         close(fd);
         goto error;
     }

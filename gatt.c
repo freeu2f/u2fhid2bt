@@ -20,9 +20,10 @@
 #include "gatt.h"
 #include "uhid.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
+#include <unistd.h>
 #include <time.h>
 
 #include <systemd/sd-bus.h>
@@ -31,11 +32,6 @@
 #define TIMEOUT_SECONDS 15
 
 #define CNT(v) (sizeof((v)) / sizeof(*(v)))
-
-#define MATCH \
-    "type='signal',sender='org.bluez',member='PropertiesChanged'," \
-    "interface='org.freedesktop.DBus.Properties',path='%s'," \
-    "arg0='org.bluez.GattCharacteristic1'"
 
 static const struct {
     const char *uuid;
@@ -60,32 +56,26 @@ struct send {
     sd_bus_slot     *slt; /* Current outstanding method call */
     uint16_t         mtu; /* BT MTU (cached) */
     sd_event_source *out; /* Timeout event */
+    sd_event_source *not; /* Event to catch incoming packets from BT */
 };
 
 struct u2f_gatt {
-    char         *svc;            /* Service (D-Bus Object Path) */
-    char         *chr[CNT(chrs)]; /* Characteristics (D-Bus Object Paths) */
+    char            *svc;            /* Service (D-Bus Object Path) */
+    char            *chr[CNT(chrs)]; /* Characteristics (D-Bus Object Paths) */
 
-    sd_bus_slot  *flt;            /* Filter to catch incoming packets from BT */
+    u2f_gatt_cbk    *cbk;            /* Response callback */
+    void            *msc;            /* Misc. data */
 
-    u2f_gatt_cbk *cbk;            /* Response callback */
-    void         *msc;            /* Misc. data */
-
-    struct send   snd;            /* State for the current send operation */
+    struct send      snd;            /* State for the current send operation */
 };
 
 static void
 cleanup_send(u2f_gatt *gatt)
 {
-    const char *obj = NULL;
+    if (gatt->snd.not)
+        close(sd_event_source_get_io_fd(gatt->snd.not));
 
-    obj = u2f_gatt_get(gatt, "u2fStatus");
-    if (obj) {
-        sd_bus_call_method_async(sd_bus_slot_get_bus(gatt->flt), NULL,
-                                 "org.bluez", obj, GATT_CHARACTERISTIC,
-                                 "StopNotify", NULL, NULL, NULL);
-    }
-
+    sd_event_source_unref(gatt->snd.not);
     sd_event_source_unref(gatt->snd.out);
     sd_bus_slot_unref(gatt->snd.slt);
     free(gatt->snd.req.cmd);
@@ -121,12 +111,10 @@ start_timer(u2f_gatt *gatt, sd_event *evt)
 }
 
 static void
-on_sts_bytes(u2f_gatt *gatt, const void *buf, size_t len)
+on_bytes(u2f_gatt *gatt, const u2f_pkt *pkt, size_t len)
 {
     size_t off = offsetof(u2f_pkt, seq.buf);
     struct io *rep = &gatt->snd.rep;
-    const uint8_t *src = buf;
-    const u2f_pkt *pkt = buf;
 
     if (!gatt->snd.req.cmd ||
         gatt->snd.req.len < be16toh(gatt->snd.req.cmd->len))
@@ -153,7 +141,7 @@ on_sts_bytes(u2f_gatt *gatt, const void *buf, size_t len)
     if (len > be16toh(rep->cmd->len) - rep->len)
         len = be16toh(rep->cmd->len) - rep->len;
 
-    memcpy(&rep->cmd->buf[rep->len], &src[off], len);
+    memcpy(&rep->cmd->buf[rep->len], &((uint8_t *) pkt)[off], len);
     rep->len += len;
 
     if (rep->len < be16toh(rep->cmd->len))
@@ -184,56 +172,18 @@ error:
 }
 
 static int
-on_sts_notify(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
+on_pkt(sd_event_source *s, int fd, uint32_t revents, void *userdata)
 {
-    int r;
+    u2f_gatt *gatt = userdata;
+    u2f_pkt *pkt = NULL;
+    ssize_t len;
 
-    r = sd_bus_message_skip(m, "s");
-    if (r < 0)
-        return r;
-
-    r = sd_bus_message_enter_container(m, 'a', "{sv}");
-    if (r < 0)
-        return r;
-
-    while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
-        const char *name = NULL;
-
-        r = sd_bus_message_read(m, "s", &name);
-        if (r < 0)
-            return r;
-
-        if (strcmp(name, "Value") == 0) {
-            const void *buf = NULL;
-            size_t len = 0;
-
-            r = sd_bus_message_enter_container(m, 'v', "ay");
-            if (r < 0)
-                return r;
-
-            r = sd_bus_message_read_array(m, 'y', &buf, &len);
-            if (r < 0)
-                return r;
-
-            r = sd_bus_message_exit_container(m);
-            if (r < 0)
-                return r;
-
-            on_sts_bytes(misc, buf, len);
-        } else {
-            r = sd_bus_message_skip(m, "v");
-            if (r < 0)
-                return r;
-        }
-
-        r = sd_bus_message_exit_container(m);
-        if (r < 0)
-            return r;
-    }
-
-    r = sd_bus_message_exit_container(m);
-    if (r < 0)
-        return r;
+    pkt = alloca(sizeof(*pkt) + gatt->snd.mtu);
+    len = read(fd, pkt, sizeof(*pkt) + gatt->snd.mtu);
+    if (len < 0)
+        u2f_gatt_cancel(gatt);
+    else if (len > offsetof(u2f_pkt, seq.buf))
+        on_bytes(gatt, pkt, len);
 
     return 0;
 }
@@ -316,7 +266,10 @@ on_mtu(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
     if (size != sizeof(*mtu))
         goto error;
 
-    gatt->snd.mtu = be16toh(*mtu);
+    fprintf(stderr, "MTUs: %hu %hu\n", gatt->snd.mtu, be16toh(*mtu));
+    if (gatt->snd.mtu > be16toh(*mtu))
+        gatt->snd.mtu = be16toh(*mtu);
+
     if (gatt->snd.mtu <= sizeof(u2f_cmd) || gatt->snd.mtu > 4096)
         goto error;
 
@@ -361,12 +314,28 @@ on_notify(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
 {
     u2f_gatt *gatt = userdata;
     const char *obj = NULL;
+    uint16_t mtu = 0;
+    int fd = -1;
 
     sd_bus_slot_unref(gatt->snd.slt);
     gatt->snd.slt = NULL;
 
     if (sd_bus_error_is_set(ret_error))
         goto error;
+
+    if (sd_bus_message_read(m, "hq", &fd, &mtu) < 0)
+        goto error;
+
+    fd = dup(fd);
+    if (fd < 0)
+        goto error;
+
+    gatt->snd.mtu = mtu;
+    if (sd_event_add_io(SD_EVENT_DEFAULT, &gatt->snd.not, fd,
+                        EPOLLIN, on_pkt, gatt) < 0) {
+        close(fd);
+        goto error;
+    }
 
     obj = u2f_gatt_get(gatt, "u2fControlPointLength");
     if (!obj)
@@ -397,7 +366,7 @@ u2f_gatt_free(u2f_gatt *gatt)
     for (size_t i = 0; i < CNT(chrs); i++)
         free(gatt->chr[i]);
 
-    sd_bus_slot_unref(gatt->flt);
+    cleanup_send(gatt);
     free(gatt);
 }
 
@@ -438,33 +407,6 @@ u2f_gatt_set(u2f_gatt *gatt, const char *id, const char *obj)
 
         u2f_gatt_cancel(gatt);
 
-        if (strcmp(chrs[i].name, "u2fStatus") == 0) {
-            sd_bus *bus = NULL;
-            char *match = NULL;
-            int r;
-
-            r = asprintf(&match, MATCH, obj);
-            if (r < 0)
-                return -errno;
-
-            if (gatt->flt) {
-                sd_bus_slot_unref(gatt->flt);
-                gatt->flt = NULL;
-            }
-
-            r = sd_bus_default_system(&bus);
-            if (r < 0) {
-                free(match);
-                return r;
-            }
-
-            r = sd_bus_add_match(bus, &gatt->flt, match, on_sts_notify, gatt);
-            sd_bus_unref(bus);
-            free(match);
-            if (r < 0)
-                return r;
-        }
-
         if (obj) {
             tmp = strdup(obj);
             if (!tmp)
@@ -501,6 +443,14 @@ u2f_gatt_get(const u2f_gatt *gatt, const char *id)
     return NULL;
 }
 
+bool
+u2f_gatt_ready(u2f_gatt *gatt)
+{
+    return u2f_gatt_get(gatt, "u2fControlPoint")
+        && u2f_gatt_get(gatt, "u2fStatus")
+        && u2f_gatt_get(gatt, "u2fControlPointLength");
+}
+
 void
 u2f_gatt_cancel(u2f_gatt *gatt)
 {
@@ -514,7 +464,6 @@ void
 u2f_gatt_send(u2f_gatt *gatt, const u2f_cmd *cmd)
 {
     const char *obj = NULL;
-    sd_event *evt = NULL;
 
     obj = u2f_gatt_get(gatt, "u2fStatus");
     if (!obj)
@@ -528,24 +477,18 @@ u2f_gatt_send(u2f_gatt *gatt, const u2f_cmd *cmd)
 
     memcpy(gatt->snd.req.cmd, cmd, sizeof(u2f_cmd) + be16toh(cmd->len));
 
-    if (sd_event_default(&evt) < 0)
-        goto error;
-
-    gatt->snd.out = start_timer(gatt, evt);
+    gatt->snd.out = start_timer(gatt, SD_EVENT_DEFAULT);
     if (!gatt->snd.out)
         goto error;
 
-    if (sd_bus_call_method_async(sd_bus_slot_get_bus(gatt->flt),
-                                 &gatt->snd.slt, "org.bluez", obj,
-                                 GATT_CHARACTERISTIC, "StartNotify",
-                                 on_notify, gatt, "") < 0)
+    if (sd_bus_call_method_async(SD_BUS_DEFAULT, &gatt->snd.slt, "org.bluez",
+                                 obj, GATT_CHARACTERISTIC, "AcquireNotify",
+                                 on_notify, gatt, "a{sv}", 0) < 0)
         goto error;
 
-    sd_event_unref(evt);
     return;
 
 error:
     gatt->cbk(u2f_cmd_mkerr(U2F_ERR_OTHER), gatt->msc);
     cleanup_send(gatt);
-    sd_event_unref(evt);
 }

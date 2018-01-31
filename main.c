@@ -42,83 +42,197 @@
     "type='signal',sender='org.bluez',path='/',member='InterfacesRemoved'," \
     "interface='org.freedesktop.DBus.ObjectManager'"
 
-typedef struct vu2f vu2f;
+struct dev;
 
-struct vu2f {
-    vu2f     *prev;
-    vu2f     *next;
-    u2f_gatt *gatt;
-    u2f_uhid *uhid;
+struct svc {
+    struct svc *prev;
+    struct svc *next;
+
+    u2f_gatt   *gatt;
+    u2f_uhid   *uhid;
+    struct dev *prnt;
 };
 
-static vu2f vu2fs = { .prev = &vu2fs, .next = &vu2fs };
+struct dev {
+    struct dev *prev;
+    struct dev *next;
+
+    struct svc  svcs;
+    char       *path;
+    char       *name;
+};
+
+static struct dev devs = { .prev = &devs, .next = &devs };
 
 static void
-vu2f_free(vu2f *v)
+on_uhid(const u2f_cmd *cmd, void *misc)
 {
-    if (!v)
-        return;
-
-    v->prev->next = v->next;
-    v->next->prev = v->prev;
-    u2f_uhid_free(v->uhid);
-    u2f_gatt_free(v->gatt);
-    free(v);
-}
-
-static void
-uhid_cb(const u2f_cmd *cmd, void *misc)
-{
-    vu2f *v = misc;
-    u2f_gatt_send(v->gatt, cmd);
+    struct svc *svc = misc;
+    u2f_gatt_send(svc->gatt, cmd);
 }
 
 static void
-gatt_cb(const u2f_cmd *cmd, void *misc)
+on_gatt(const u2f_cmd *cmd, void *misc)
 {
-    vu2f *v = misc;
-    u2f_uhid_send(v->uhid, cmd);
+    struct svc *svc = misc;
+    if (svc->uhid)
+        u2f_uhid_send(svc->uhid, cmd);
 }
 
-static vu2f *
-vu2f_new(const char *obj)
+static struct dev *
+dev_find(const char *path)
 {
-    vu2f *v = NULL;
-
-    v = calloc(1, sizeof(*v));
-    if (!v)
-        return NULL;
-
-    v->next = v;
-    v->prev = v;
-
-    v->uhid = u2f_uhid_new("name", "phys", "uniq", uhid_cb, v);
-    if (!v->uhid)
-        goto error;
-
-    v->gatt = u2f_gatt_new(obj, gatt_cb, v);
-    if (!v->gatt)
-        goto error;
-
-    return v;
-
-error:
-    vu2f_free(v);
-    return NULL;
-}
-
-static vu2f *
-find_vu2f_by_svc(const char *svc)
-{
-    if (!svc)
-        return NULL;
-
-    for (vu2f *v = vu2fs.next; v != &vu2fs; v = v->next) {
-        if (v->gatt && strcmp(u2f_gatt_svc(v->gatt), svc) == 0)
-            return v;
+    for (struct dev *d = devs.next; d != &devs; d = d->next) {
+        if (strcmp(d->path, path) == 0)
+            return d;
     }
 
     return NULL;
+}
+
+static struct svc *
+svc_find(const char *path)
+{
+    for (struct dev *d = devs.next; d != &devs; d = d->next) {
+        for (struct svc *s = d->svcs.next; s != &d->svcs; s = s->next) {
+            if (strcmp(u2f_gatt_svc(s->gatt), path) == 0)
+                return s;
+        }
+    }
+
+    return NULL;
+}
+
+static void
+svc_free(struct svc *svc)
+{
+    if (!svc)
+        return;
+
+    svc->next->prev = svc->prev;
+    svc->prev->next = svc->next;
+    u2f_gatt_free(svc->gatt);
+    u2f_uhid_free(svc->uhid);
+    free(svc);
+}
+
+static void
+dev_free(struct dev *dev)
+{
+    if (!dev)
+        return;
+
+    while (dev->svcs.next != &dev->svcs)
+        svc_free(dev->svcs.next);
+
+    dev->next->prev = dev->prev;
+    dev->prev->next = dev->next;
+    free(dev->name);
+    free(dev->path);
+    free(dev);
+}
+
+static int
+dev_add(const char *parent, const char *path, const char *info)
+{
+    struct dev *dev = NULL;
+
+    if (dev_find(path))
+        return 0;
+
+    dev = calloc(1, sizeof(*dev));
+    if (!dev)
+        return -errno;
+
+    dev->svcs.next = &dev->svcs;
+    dev->svcs.prev = &dev->svcs;
+    dev->path = strdup(path);
+    dev->name = strdup(info);
+    if (!dev->path || !dev->name) {
+        dev_free(dev);
+        return -ENOMEM;
+    }
+
+    fprintf(stderr, "+%s (%s)\n", path, info);
+    devs.next->prev = dev;
+    dev->prev = &devs;
+    dev->next = devs.next;
+    devs.next = dev;
+    return 0;
+}
+
+static int
+svc_add(const char *parent, const char *path, const char *info)
+{
+    struct dev *dev = dev_find(parent);
+    struct svc *svc = svc_find(path);
+
+    if (svc || !dev || !info || strcasecmp(info, SVC_UUID) != 0)
+        return 0;
+
+    svc = calloc(1, sizeof(*svc));
+    if (!svc)
+        return -errno;
+
+    svc->prnt = dev;
+    svc->gatt = u2f_gatt_new(path, on_gatt, svc);
+    if (!svc->gatt) {
+        free(svc);
+        return -errno;
+    }
+
+    fprintf(stderr, "+%s\n", path);
+    dev->svcs.next->prev = svc;
+    svc->prev = &dev->svcs;
+    svc->next = dev->svcs.next;
+    dev->svcs.next = svc;
+    return 0;
+}
+
+static int
+chr_add(const char *parent, const char *path, const char *info)
+{
+    struct svc *svc = svc_find(parent);
+    int r;
+
+    if (!svc || !path || !info)
+        return 0;
+
+    fprintf(stderr, "+%s (%s)\n", path, info);
+    r = u2f_gatt_set(svc->gatt, info, path);
+    if (r < 0)
+        return r;
+
+    if (!svc->uhid && u2f_gatt_ready(svc->gatt)) {
+        svc->uhid = u2f_uhid_new(svc->prnt->name, svc->prnt->name,
+                                 u2f_gatt_svc(svc->gatt), on_uhid, svc);
+        if (!svc->uhid)
+            return -ENOMEM;
+    }
+
+    return 0;
+}
+
+static void
+chr_rem(const char *path)
+{
+    for (struct dev *d = devs.next; d != &devs; d = d->next) {
+        for (struct svc *s = d->svcs.next; s != &d->svcs; s = s->next) {
+            const char *id = u2f_gatt_has(s->gatt, path);
+
+            if (!id)
+                continue;
+
+            u2f_gatt_set(s->gatt, id, NULL);
+
+            if (!u2f_gatt_ready(s->gatt)) {
+                u2f_uhid_free(s->uhid);
+                s->uhid = NULL;
+            }
+
+            return;
+        }
+    }
 }
 
 static int
@@ -135,14 +249,14 @@ static int
 on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
 {
     sd_bus *bus = sd_bus_message_get_bus(m);
-    const char *obj = NULL;
+    const char *path = NULL;
     int r;
 
     r = sd_bus_message_has_signature(m, "oa{sa{sv}}");
     if (r < 0)
         return r;
 
-    r = sd_bus_message_read(m, "o", &obj);
+    r = sd_bus_message_read(m, "o", &path);
     if (r < 0)
         return r;
 
@@ -153,7 +267,7 @@ on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
     while ((r = sd_bus_message_enter_container(m, 'e', "sa{sv}")) > 0) {
         const char *parent = NULL;
         const char *iface = NULL;
-        const char *uuid = NULL;
+        const char *info = NULL;
 
         r = sd_bus_message_read(m, "s", &iface);
         if (r < 0)
@@ -164,26 +278,20 @@ on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
             return r;
 
         while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
-            const char *name = NULL;
+            const char *prop = NULL;
 
-            r = sd_bus_message_read(m, "s", &name);
+            r = sd_bus_message_read(m, "s", &prop);
             if (r < 0)
                 return r;
 
-            if (strcmp(name, "UUID") == 0) {
-                r = sd_bus_message_read(m, "v", "s", &uuid);
-                if (r < 0)
-                    return r;
-            } else if (strcmp(name, "Service") == 0 ||
-                       strcmp(name, "Device") == 0) {
+            if (strcmp(prop, "Service") == 0 || strcmp(prop, "Device") == 0)
                 r = sd_bus_message_read(m, "v", "o", &parent);
-                if (r < 0)
-                    return r;
-            } else {
+            else if (strcmp(prop, "UUID") == 0 || strcmp(prop, "Name") == 0)
+                r = sd_bus_message_read(m, "v", "s", &info);
+            else
                 r = sd_bus_message_skip(m, "v");
-                if (r < 0)
-                    return r;
-            }
+            if (r < 0)
+                return r;
 
             r = sd_bus_message_exit_container(m);
             if (r < 0)
@@ -199,33 +307,19 @@ on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
             return r;
 
         if (strcmp(iface, "org.bluez.GattManager1") == 0) {
-            r = sd_bus_call_method_async(bus, NULL, "org.bluez", obj, iface,
+            r = sd_bus_call_method_async(bus, NULL, "org.bluez", path, iface,
                                          "RegisterApplication", on_reply,
                                          NULL, "oa{sv}", MAN_PATH, 0);
-            if (r < 0)
-                return r;
-            fprintf(stderr, "+%s\n", obj);
-        } else if (strcmp(iface, "org.bluez.GattService1") == 0 &&
-                   uuid && strcasecmp(uuid, SVC_UUID) == 0) {
-            vu2f *v = find_vu2f_by_svc(obj);
-            if (!v) {
-                v = vu2f_new(obj);
-                if (!v)
-                    return -ENOMEM;
-
-                v->next = &vu2fs;
-                v->prev = vu2fs.prev;
-                vu2fs.prev->next = v;
-                vu2fs.prev = v;
-                fprintf(stderr, "+%s\n", obj);
-            }
-        } else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0) {
-            vu2f *v = find_vu2f_by_svc(parent);
-            if (v) {
-                u2f_gatt_set(v->gatt, uuid, obj);
-                fprintf(stderr, "+%s\n", obj);
-            }
+            fprintf(stderr, "+%s\n", path);
+        } else if (strcmp(iface, "org.bluez.Device1") == 0 && info) {
+            r = dev_add(parent, path, info);
+        } else if (strcmp(iface, "org.bluez.GattService1") == 0 && parent && info) {
+            r = svc_add(parent, path, info);
+        } else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0 && parent && info) {
+            r = chr_add(parent, path, info);
         }
+        if (r < 0)
+            return r;
     }
     if (r < 0)
         return r;
@@ -240,14 +334,14 @@ on_svc_iface_add(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
 static int
 on_svc_iface_rem(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
 {
-    const char *obj = NULL;
+    const char *path = NULL;
     int r;
 
     r = sd_bus_message_has_signature(m, "oas");
     if (r < 0)
         return r;
 
-    r = sd_bus_message_read(m, "o", &obj);
+    r = sd_bus_message_read(m, "o", &path);
     if (r < 0)
         return r;
 
@@ -266,23 +360,12 @@ on_svc_iface_rem(sd_bus_message *m, void *misc, sd_bus_error *ret_error)
         if (r < 0)
             return r;
 
-        if (strcmp(iface, "org.bluez.GattService1") == 0) {
-            fprintf(stderr, "-%s\n", obj);
-            vu2f_free(find_vu2f_by_svc(obj));
-        } else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0) {
-            fprintf(stderr, "-%s\n", obj);
-
-            for (vu2f *v = vu2fs.next; v != &vu2fs; v = v->next) {
-                const char *id = NULL;
-
-                if (!v->gatt)
-                    continue;
-
-                id = u2f_gatt_has(v->gatt, obj);
-                if (id)
-                    u2f_gatt_set(v->gatt, id, NULL);
-            }
-        }
+        if (strcmp(iface, "org.bluez.Device1") == 0)
+            dev_free(dev_find(path));
+        else if (strcmp(iface, "org.bluez.GattService1") == 0)
+            svc_free(svc_find(path));
+        else if (strcmp(iface, "org.bluez.GattCharacteristic1") == 0)
+            chr_rem(path);
     }
 
     r = sd_bus_message_exit_container(m);
@@ -392,9 +475,9 @@ main(int argc, char *argv[])
     if (r < 0)
         error(EXIT_FAILURE, -r, "Error creating SIGTERM event source");
 
-    r = sd_bus_default_system(&bus);
+    r = sd_bus_default(&bus);
     if (r < 0)
-        error(EXIT_FAILURE, -r, "Error connecting to system bus");
+        error(EXIT_FAILURE, -r, "Error connecting to bus");
 
     r = sd_event_add_io(event, NULL, sd_bus_get_fd(bus),
                         EPOLLIN | EPOLLPRI | EPOLLET | EPOLLRDHUP,
@@ -416,14 +499,8 @@ main(int argc, char *argv[])
 
     r = sd_event_loop(event);
 
-    while (vu2fs.next != &vu2fs) {
-        vu2f *v = vu2fs.next;
-        v->next->prev = v->prev;
-        v->prev->next = v->next;
-        u2f_uhid_free(v->uhid);
-        u2f_gatt_free(v->gatt);
-        free(v);
-    }
+    while (devs.next != &devs)
+        dev_free(devs.next);
 
     return r;
 }

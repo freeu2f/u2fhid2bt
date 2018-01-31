@@ -15,36 +15,31 @@
  * limitations under the License.
  */
 
-#include "u2f.h"
-
-#include <stdbool.h>
-
-typedef struct u2f_gatt u2f_gatt;
-typedef void (u2f_gatt_cbk)(const u2f_cmd *cmd, void *msc);
-
-void
-u2f_gatt_free(u2f_gatt *gatt);
-
-u2f_gatt *
-u2f_gatt_new(const char *svc, u2f_gatt_cbk *cbk, void *msc);
-
-const char *
-u2f_gatt_svc(const u2f_gatt *gatt);
+#include <hidapi/hidapi.h>
+#include "../uhid.h"
+#include <stdio.h>
 
 int
-u2f_gatt_set(u2f_gatt *gatt, const char *id, const char *obj);
+main(int argc, const char *argv[])
+{
+    struct hid_device_info *info = NULL;
+    size_t cnt = 0;
 
-const char *
-u2f_gatt_has(u2f_gatt *gatt, const char *obj);
+    if (hid_init() != 0) {
+        fprintf(stderr, "Error initializing HID API!\n");
+        return 1;
+    }
 
-const char *
-u2f_gatt_get(const u2f_gatt *gatt, const char *id);
+    info = hid_enumerate(UHID_VEND, UHID_PROD);
+    if (!info) {
+        fprintf(stderr, "Error enumerating HID devices!\n");
+        return 1;
+    }
 
-bool
-u2f_gatt_ready(u2f_gatt *gatt);
+    for (struct hid_device_info *i = info; i; i = i->next, cnt++)
+        printf("%s\n", i->path);
 
-void
-u2f_gatt_cancel(u2f_gatt *gatt);
-
-void
-u2f_gatt_send(u2f_gatt *gatt, const u2f_cmd *cmd);
+    hid_free_enumeration(info);
+    hid_exit();
+    return cnt > 0 ? 0 : 1;
+}
