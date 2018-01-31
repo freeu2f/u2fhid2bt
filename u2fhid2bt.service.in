@@ -1,0 +1,10 @@
+[Unit]
+Description=U2F HID to Bluetooth Proxy
+Requires=bluetooth.service
+After=bluetooth.service
+
+[Service]
+ExecStart=@libexecdir@/u2fhid2bt
+
+[Install]
+WantedBy=bluetooth.target

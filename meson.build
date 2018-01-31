@@ -23,7 +23,10 @@ add_project_arguments([
 ], language: 'c')
 
 libsystemd = dependency('libsystemd', version: '>=237')
+systemd = dependency('systemd', version: '>=237')
 libhidapi = dependency('hidapi-hidraw')
+
+
 
 u2fhid2bt = executable('u2fhid2bt',
     'gatt.c',
@@ -57,6 +60,15 @@ hidtest = executable('hidtest',
     'test/u2f-tests/u2f_hid.h',
     'test/u2f-tests/u2f.h',
     dependencies: libhidapi
+)
+
+cd = configuration_data()
+cd.set('libexecdir', get_option('prefix') + '/' + get_option('libexecdir'))
+configure_file(
+    install_dir: systemd.get_pkgconfig_variable('systemdsystemunitdir'),
+    configuration: cd,
+    input: 'u2fhid2bt.service.in',
+    output: 'u2fhid2bt.service',
 )
 
 test('tests', find_program('test/runtests'))
