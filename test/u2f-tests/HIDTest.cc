@@ -141,13 +141,6 @@ void test_LongEcho() {
   CHECK_EQ(0, memcmp(challenge, response, sizeof(challenge)));
 
   INFO << "sent: " << sent << ", received: " << received;
-
-  // Expected transfer times for 2ms bInterval.
-  // We do not want fobs to be too slow or too agressive.
-  CHECK_GE(sent, .020);
-  CHECK_LE(sent, .075);
-  CHECK_GE(received, .020);
-  CHECK_LE(received, .075);
 }
 
 // Execute WINK, if implemented.
