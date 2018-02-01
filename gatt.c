@@ -29,7 +29,7 @@
 #include <systemd/sd-bus.h>
 
 #define GATT_CHARACTERISTIC "org.bluez.GattCharacteristic1"
-#define TIMEOUT_SECONDS 15
+#define TIMEOUT_SECONDS 5
 
 #define CNT(v) (sizeof((v)) / sizeof(*(v)))
 
