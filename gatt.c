@@ -94,16 +94,16 @@ on_timeout(sd_event_source *s, uint64_t usec, void *userdata)
 }
 
 static sd_event_source *
-start_timer(u2f_gatt *gatt, sd_event *evt)
+start_timer(u2f_gatt *gatt)
 {
     sd_event_source *out = NULL;
     uint64_t usec = 0;
 
-    if (sd_event_now(evt, CLOCK_MONOTONIC, &usec) < 0)
+    if (sd_event_now(SD_EVENT_DEFAULT, CLOCK_MONOTONIC, &usec) < 0)
         return NULL;
 
     usec += TIMEOUT_SECONDS * 1000000;
-    if (sd_event_add_time(evt, &out, CLOCK_MONOTONIC, usec, 1,
+    if (sd_event_add_time(SD_EVENT_DEFAULT, &out, CLOCK_MONOTONIC, usec, 1,
                           on_timeout, gatt) < 0)
         return NULL;
 
@@ -154,7 +154,7 @@ on_bytes(u2f_gatt *gatt, const u2f_pkt *pkt, size_t len)
         free(rep->cmd);
         memset(rep, 0, sizeof(*rep));
 
-        out = start_timer(gatt, sd_event_source_get_event(gatt->snd.out));
+        out = start_timer(gatt);
         if (out) {
             sd_event_source_unref(gatt->snd.out);
             gatt->snd.out = out;
@@ -477,7 +477,7 @@ u2f_gatt_send(u2f_gatt *gatt, const u2f_cmd *cmd)
 
     memcpy(gatt->snd.req.cmd, cmd, sizeof(u2f_cmd) + be16toh(cmd->len));
 
-    gatt->snd.out = start_timer(gatt, SD_EVENT_DEFAULT);
+    gatt->snd.out = start_timer(gatt);
     if (!gatt->snd.out)
         goto error;
 
